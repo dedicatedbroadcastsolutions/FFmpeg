@@ -4195,6 +4195,48 @@ fail:
     return err;
 }
 #endif
+
+#if CONFIG_QSV
+/**
+ * Map Vulkan frame to QSV for encoding
+ * Vulkan -> DRM PRIME -> QSV pipeline
+ */
+static int vulkan_map_to_qsv(AVHWFramesContext *hwfc, AVFrame *dst,
+                             const AVFrame *src, int flags)
+{
+    int err;
+    AVFrame *tmp = av_frame_alloc();
+    if (!tmp)
+        return AVERROR(ENOMEM);
+
+    av_log(hwfc, AV_LOG_VERBOSE, "Vulkan: Mapping Vulkan frame to QSV via DRM PRIME for encoding\n");
+
+    /* Export Vulkan to DRM PRIME first */
+    tmp->format = AV_PIX_FMT_DRM_PRIME;
+    err = vulkan_map_to_drm(hwfc, tmp, src, flags);
+    if (err < 0) {
+        av_log(hwfc, AV_LOG_ERROR, "Failed to export Vulkan to DRM PRIME: %s\n", av_err2str(err));
+        goto fail;
+    }
+
+    /* Now map DRM PRIME to QSV */
+    err = av_hwframe_map(dst, tmp, flags);
+    if (err < 0) {
+        av_log(hwfc, AV_LOG_ERROR, "Failed to map DRM PRIME to QSV: %s\n", av_err2str(err));
+        goto fail;
+    }
+
+    /* Replace frame reference to track original Vulkan frame */
+    err = ff_hwframe_map_replace(dst, src);
+    
+    if (err >= 0)
+        av_log(hwfc, AV_LOG_DEBUG, "Successfully mapped Vulkan frame to QSV!\n");
+
+fail:
+    av_frame_free(&tmp);
+    return err;
+}
+#endif
 #endif
 
 static int vulkan_map_from(AVHWFramesContext *hwfc, AVFrame *dst,
@@ -4215,6 +4257,16 @@ static int vulkan_map_from(AVHWFramesContext *hwfc, AVFrame *dst,
             return vulkan_map_to_vaapi(hwfc, dst, src, flags);
         else
             return AVERROR(ENOSYS);
+#endif
+#if CONFIG_QSV
+    case AV_PIX_FMT_QSV:
+        if (p->vkctx.extensions & FF_VK_EXT_DRM_MODIFIER_FLAGS) {
+            av_log(hwfc, AV_LOG_VERBOSE, "Vulkan: Initiating Vulkan->QSV zero-copy interop for encoding\n");
+            return vulkan_map_to_qsv(hwfc, dst, src, flags);
+        } else {
+            av_log(hwfc, AV_LOG_ERROR, "Vulkan: DRM modifier extensions required for QSV interop\n");
+            return AVERROR(ENOSYS);
+        }
 #endif
 #endif
     default:

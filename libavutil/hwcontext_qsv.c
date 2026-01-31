@@ -2365,6 +2365,44 @@ static int qsv_dynamic_pool_map_to(AVHWFramesContext *dst_ctx,
     }
 #endif
 
+#if CONFIG_VAAPI && CONFIG_LIBDRM
+    case AV_PIX_FMT_DRM_PRIME:
+    {
+        /* DRM PRIME from Vulkan - map to VAAPI first then to QSV */
+        AVFrame *vaapi_frame = av_frame_alloc();
+        VASurfaceID *surface_id_internal;
+
+        if (!vaapi_frame) {
+            ret = AVERROR(ENOMEM);
+            goto fail;
+        }
+
+        av_log(dst_ctx, AV_LOG_VERBOSE, "QSV: Importing DRM PRIME frame from Vulkan\n");
+
+        vaapi_frame->format = AV_PIX_FMT_VAAPI;
+        ret = av_hwframe_map(vaapi_frame, src, flags);
+        if (ret < 0) {
+            av_log(dst_ctx, AV_LOG_ERROR, "Failed to map DRM PRIME to VAAPI: %s\n", av_err2str(ret));
+            av_frame_free(&vaapi_frame);
+            goto fail;
+        }
+
+        surface_id_internal = av_calloc(1, sizeof(*surface_id_internal));
+        if (!surface_id_internal) {
+            av_frame_free(&vaapi_frame);
+            ret = AVERROR(ENOMEM);
+            goto fail;
+        }
+
+        *surface_id_internal = (VASurfaceID)(uintptr_t)vaapi_frame->data[3];
+        handle_pairs_internal->first = (mfxHDL)surface_id_internal;
+        handle_pairs_internal->second = (mfxMemId)MFX_INFINITE;
+
+        av_frame_free(&vaapi_frame);
+        break;
+    }
+#endif
+
 #if CONFIG_D3D11VA
     case AV_PIX_FMT_D3D11:
     {
