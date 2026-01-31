@@ -47,6 +47,9 @@
 #if CONFIG_VAAPI
 #include "hwcontext_vaapi.h"
 #endif
+#if CONFIG_QSV
+#include "hwcontext_qsv.h"
+#endif
 
 #if CONFIG_LIBDRM
 #if CONFIG_VAAPI
@@ -3610,6 +3613,50 @@ fail:
     return err;
 }
 #endif
+
+#if CONFIG_QSV
+/**
+ * Map QSV frame to Vulkan for zero-copy interop
+ * QSV -> DRM PRIME -> Vulkan pipeline
+ */
+static int vulkan_map_from_qsv(AVHWFramesContext *dst_fc,
+                               AVFrame *dst, const AVFrame *src,
+                               int flags)
+{
+    int err;
+    AVFrame *tmp = av_frame_alloc();
+
+    if (!tmp)
+        return AVERROR(ENOMEM);
+
+    av_log(dst_fc, AV_LOG_VERBOSE, "Vulkan: Mapping QSV frame via DRM PRIME for zero-copy interop\n");
+
+    /* Map QSV to DRM PRIME first */
+    tmp->format = AV_PIX_FMT_DRM_PRIME;
+    err = av_hwframe_map(tmp, src, flags);
+    if (err < 0) {
+        av_log(dst_fc, AV_LOG_ERROR, "Failed to map QSV to DRM PRIME: %s\n", av_err2str(err));
+        goto fail;
+    }
+
+    /* Now import DRM PRIME into Vulkan */
+    err = vulkan_map_from_drm(dst_fc, dst, tmp, flags);
+    if (err < 0) {
+        av_log(dst_fc, AV_LOG_ERROR, "Failed to import DRM PRIME to Vulkan: %s\n", av_err2str(err));
+        goto fail;
+    }
+
+    /* Replace frame reference to track original QSV frame */
+    err = ff_hwframe_map_replace(dst, src);
+    
+    if (err >= 0)
+        av_log(dst_fc, AV_LOG_DEBUG, "Successfully mapped QSV frame to Vulkan!\n");
+
+fail:
+    av_frame_free(&tmp);
+    return err;
+}
+#endif
 #endif
 
 #if CONFIG_CUDA
@@ -3944,6 +3991,16 @@ static int vulkan_map_to(AVHWFramesContext *hwfc, AVFrame *dst,
             return vulkan_map_from_vaapi(hwfc, dst, src, flags);
         else
             return AVERROR(ENOSYS);
+#endif
+#if CONFIG_QSV
+    case AV_PIX_FMT_QSV:
+        if (p->vkctx.extensions & FF_VK_EXT_DRM_MODIFIER_FLAGS) {
+            av_log(hwfc, AV_LOG_VERBOSE, "Vulkan: Initiating QSV->Vulkan zero-copy interop\n");
+            return vulkan_map_from_qsv(hwfc, dst, src, flags);
+        } else {
+            av_log(hwfc, AV_LOG_ERROR, "Vulkan: DRM modifier extensions required for QSV interop\n");
+            return AVERROR(ENOSYS);
+        }
 #endif
     case AV_PIX_FMT_DRM_PRIME:
         if (p->vkctx.extensions & FF_VK_EXT_DRM_MODIFIER_FLAGS)

@@ -32,6 +32,9 @@
 #if CONFIG_VAAPI
 #include "hwcontext_vaapi.h"
 #endif
+#if CONFIG_VULKAN
+#include "hwcontext_vulkan.h"
+#endif
 #if CONFIG_D3D11VA
 #include "hwcontext_d3d11va.h"
 #endif
@@ -51,6 +54,12 @@
 #include "time.h"
 #include "imgutils.h"
 #include "avassert.h"
+
+#if CONFIG_LIBDRM
+#include "hwcontext_drm.h"
+#include <unistd.h>
+#include <fcntl.h>
+#endif
 
 #define QSV_VERSION_ATLEAST(MAJOR, MINOR)   \
     (MFX_VERSION_MAJOR > (MAJOR) ||         \
@@ -1494,14 +1503,33 @@ static int qsv_transfer_get_formats(AVHWFramesContext *ctx,
                                     enum AVHWFrameTransferDirection dir,
                                     enum AVPixelFormat **formats)
 {
+    QSVFramesContext *s = ctx->hwctx;
     enum AVPixelFormat *fmts;
+    int nb_fmts = 1; /* sw_format */
 
-    fmts = av_malloc_array(2, sizeof(*fmts));
+#if CONFIG_VAAPI && CONFIG_LIBDRM
+    /* Add DRM_PRIME for Vulkan interop if VAAPI child context exists */
+    if (s->child_frames_ref) {
+        AVHWFramesContext *child_frames_ctx = (AVHWFramesContext*)s->child_frames_ref->data;
+        if (child_frames_ctx->device_ctx->type == AV_HWDEVICE_TYPE_VAAPI) {
+            nb_fmts++;
+            av_log(ctx, AV_LOG_VERBOSE, "QSV: Enabling DRM_PRIME transfer format for Vulkan interop\n");
+        }
+    }
+#endif
+
+    fmts = av_malloc_array(nb_fmts + 1, sizeof(*fmts));
     if (!fmts)
         return AVERROR(ENOMEM);
 
     fmts[0] = ctx->sw_format;
-    fmts[1] = AV_PIX_FMT_NONE;
+    
+#if CONFIG_VAAPI && CONFIG_LIBDRM
+    if (nb_fmts > 1)
+        fmts[1] = AV_PIX_FMT_DRM_PRIME;
+#endif
+    
+    fmts[nb_fmts] = AV_PIX_FMT_NONE;
 
     *formats = fmts;
 
@@ -1584,6 +1612,59 @@ static int qsv_frames_derive_from(AVHWFramesContext *dst_ctx,
     return 0;
 }
 
+#if CONFIG_VAAPI && CONFIG_LIBDRM
+/**
+ * Map QSV frame to DRM PRIME for Vulkan interop
+ * This enables zero-copy QSV decode -> Vulkan filter pipeline
+ */
+static int qsv_map_to_drm(AVHWFramesContext *ctx,
+                          AVFrame *dst, const AVFrame *src, int flags)
+{
+    QSVFramesContext *s = ctx->hwctx;
+    AVHWFramesContext *child_frames_ctx;
+    AVFrame *tmp = NULL;
+    int ret;
+
+    if (!s->child_frames_ref)
+        return AVERROR(ENOSYS);
+
+    child_frames_ctx = (AVHWFramesContext*)s->child_frames_ref->data;
+
+    /* Only VAAPI child context supports DRM PRIME export */
+    if (child_frames_ctx->device_ctx->type != AV_HWDEVICE_TYPE_VAAPI)
+        return AVERROR(ENOSYS);
+
+    av_log(ctx, AV_LOG_VERBOSE, "QSV->DRM PRIME: Mapping QSV frame to DRM for Vulkan interop\n");
+
+    /* Create temporary VAAPI frame */
+    tmp = av_frame_alloc();
+    if (!tmp)
+        return AVERROR(ENOMEM);
+
+    /* Map QSV to VAAPI first */
+    tmp->format = AV_PIX_FMT_VAAPI;
+    ret = qsv_map_from(ctx, tmp, src, flags);
+    if (ret < 0) {
+        av_log(ctx, AV_LOG_ERROR, "Failed to map QSV to VAAPI: %s\n", av_err2str(ret));
+        goto fail;
+    }
+
+    /* Now map VAAPI to DRM PRIME */
+    ret = av_hwframe_map(dst, tmp, flags);
+    if (ret < 0) {
+        av_log(ctx, AV_LOG_ERROR, "Failed to map VAAPI to DRM PRIME: %s\n", av_err2str(ret));
+        goto fail;
+    }
+
+    /* Replace frame reference to track original QSV frame */
+    ret = ff_hwframe_map_replace(dst, src);
+
+fail:
+    av_frame_free(&tmp);
+    return ret;
+}
+#endif /* CONFIG_VAAPI && CONFIG_LIBDRM */
+
 static int qsv_map_from(AVHWFramesContext *ctx,
                         AVFrame *dst, const AVFrame *src, int flags)
 {
@@ -1598,6 +1679,13 @@ static int qsv_map_from(AVHWFramesContext *ctx,
     if (!s->child_frames_ref)
         return AVERROR(ENOSYS);
     child_frames_ctx = (AVHWFramesContext*)s->child_frames_ref->data;
+
+#if CONFIG_VAAPI && CONFIG_LIBDRM
+    /* Handle DRM PRIME format for Vulkan interop */
+    if (dst->format == AV_PIX_FMT_DRM_PRIME) {
+        return qsv_map_to_drm(ctx, dst, src, flags);
+    }
+#endif
 
     switch (child_frames_ctx->device_ctx->type) {
 #if CONFIG_VAAPI
