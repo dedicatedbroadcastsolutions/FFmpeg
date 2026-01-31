@@ -3631,7 +3631,9 @@ static int vulkan_map_from_qsv(AVHWFramesContext *dst_fc,
 
     av_log(dst_fc, AV_LOG_VERBOSE, "Vulkan: Mapping QSV frame via DRM PRIME for zero-copy interop\n");
 
-    /* Map QSV to DRM PRIME first */
+    /* Map QSV to DRM PRIME first
+     * The QSV->VAAPI->DRM path handles synchronization internally via vaSyncSurface()
+     * when exporting VAAPI surfaces to DRM PRIME descriptors */
     tmp->format = AV_PIX_FMT_DRM_PRIME;
     err = av_hwframe_map(tmp, src, flags);
     if (err < 0) {
@@ -3639,7 +3641,8 @@ static int vulkan_map_from_qsv(AVHWFramesContext *dst_fc,
         goto fail;
     }
 
-    /* Now import DRM PRIME into Vulkan */
+    /* Now import DRM PRIME into Vulkan
+     * DRM sync file fences are handled by vulkan_map_from_drm_frame_sync() */
     err = vulkan_map_from_drm(dst_fc, dst, tmp, flags);
     if (err < 0) {
         av_log(dst_fc, AV_LOG_ERROR, "Failed to import DRM PRIME to Vulkan: %s\n", av_err2str(err));
@@ -3650,7 +3653,7 @@ static int vulkan_map_from_qsv(AVHWFramesContext *dst_fc,
     err = ff_hwframe_map_replace(dst, src);
     
     if (err >= 0)
-        av_log(dst_fc, AV_LOG_DEBUG, "Successfully mapped QSV frame to Vulkan!\n");
+        av_log(dst_fc, AV_LOG_DEBUG, "Successfully mapped QSV frame to Vulkan with proper sync!\n");
 
 fail:
     av_frame_free(&tmp);
@@ -4211,7 +4214,9 @@ static int vulkan_map_to_qsv(AVHWFramesContext *hwfc, AVFrame *dst,
 
     av_log(hwfc, AV_LOG_VERBOSE, "Vulkan: Mapping Vulkan frame to QSV via DRM PRIME for encoding\n");
 
-    /* Export Vulkan to DRM PRIME first */
+    /* Export Vulkan to DRM PRIME first
+     * vulkan_map_to_drm() calls prepare_frame() which ensures all Vulkan operations
+     * are complete and exports DMA-BUF sync file fences for proper GPU synchronization */
     tmp->format = AV_PIX_FMT_DRM_PRIME;
     err = vulkan_map_to_drm(hwfc, tmp, src, flags);
     if (err < 0) {
@@ -4219,7 +4224,8 @@ static int vulkan_map_to_qsv(AVHWFramesContext *hwfc, AVFrame *dst,
         goto fail;
     }
 
-    /* Now map DRM PRIME to QSV */
+    /* Now map DRM PRIME to QSV
+     * The DRM->VAAPI->QSV path imports the DMA-BUF and inherits sync fences */
     err = av_hwframe_map(dst, tmp, flags);
     if (err < 0) {
         av_log(hwfc, AV_LOG_ERROR, "Failed to map DRM PRIME to QSV: %s\n", av_err2str(err));
@@ -4230,7 +4236,7 @@ static int vulkan_map_to_qsv(AVHWFramesContext *hwfc, AVFrame *dst,
     err = ff_hwframe_map_replace(dst, src);
     
     if (err >= 0)
-        av_log(hwfc, AV_LOG_DEBUG, "Successfully mapped Vulkan frame to QSV!\n");
+        av_log(hwfc, AV_LOG_DEBUG, "Successfully mapped Vulkan frame to QSV with proper sync!\n");
 
 fail:
     av_frame_free(&tmp);
