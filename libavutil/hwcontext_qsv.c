@@ -1625,14 +1625,19 @@ static int qsv_map_to_drm(AVHWFramesContext *ctx,
     AVFrame *tmp = NULL;
     int ret;
 
-    if (!s->child_frames_ref)
+    if (!s->child_frames_ref) {
+        av_log(ctx, AV_LOG_DEBUG, "QSV->DRM: No child frames context, interop unavailable\n");
         return AVERROR(ENOSYS);
+    }
 
     child_frames_ctx = (AVHWFramesContext*)s->child_frames_ref->data;
 
     /* Only VAAPI child context supports DRM PRIME export */
-    if (child_frames_ctx->device_ctx->type != AV_HWDEVICE_TYPE_VAAPI)
+    if (child_frames_ctx->device_ctx->type != AV_HWDEVICE_TYPE_VAAPI) {
+        av_log(ctx, AV_LOG_DEBUG, "QSV->DRM: Child context is not VAAPI (type=%d), falling back\n",
+               child_frames_ctx->device_ctx->type);
         return AVERROR(ENOSYS);
+    }
 
     av_log(ctx, AV_LOG_VERBOSE, "QSV->DRM PRIME: Mapping QSV frame to DRM for Vulkan interop\n");
 
@@ -1646,6 +1651,7 @@ static int qsv_map_to_drm(AVHWFramesContext *ctx,
     ret = qsv_map_from(ctx, tmp, src, flags);
     if (ret < 0) {
         av_log(ctx, AV_LOG_ERROR, "Failed to map QSV to VAAPI: %s\n", av_err2str(ret));
+        av_log(ctx, AV_LOG_INFO, "QSV->Vulkan zero-copy unavailable, use hwdownload/hwupload\n");
         goto fail;
     }
 
@@ -1653,11 +1659,15 @@ static int qsv_map_to_drm(AVHWFramesContext *ctx,
     ret = av_hwframe_map(dst, tmp, flags);
     if (ret < 0) {
         av_log(ctx, AV_LOG_ERROR, "Failed to map VAAPI to DRM PRIME: %s\n", av_err2str(ret));
+        av_log(ctx, AV_LOG_INFO, "DRM PRIME export failed, falling back to system memory path\n");
         goto fail;
     }
 
     /* Replace frame reference to track original QSV frame */
     ret = ff_hwframe_map_replace(dst, src);
+
+    if (ret >= 0)
+        av_log(ctx, AV_LOG_DEBUG, "QSV->DRM zero-copy interop active\n");
 
 fail:
     av_frame_free(&tmp);

@@ -3992,8 +3992,11 @@ static int vulkan_map_to(AVHWFramesContext *hwfc, AVFrame *dst,
     case AV_PIX_FMT_VAAPI:
         if (p->vkctx.extensions & FF_VK_EXT_DRM_MODIFIER_FLAGS)
             return vulkan_map_from_vaapi(hwfc, dst, src, flags);
-        else
+        else {
+            av_log(hwfc, AV_LOG_INFO, "Vulkan: DRM modifier extensions not available for VAAPI interop\n");
+            av_log(hwfc, AV_LOG_INFO, "Falling back to system memory path (use hwdownload/hwupload)\n");
             return AVERROR(ENOSYS);
+        }
 #endif
 #if CONFIG_QSV
     case AV_PIX_FMT_QSV:
@@ -4002,14 +4005,18 @@ static int vulkan_map_to(AVHWFramesContext *hwfc, AVFrame *dst,
             return vulkan_map_from_qsv(hwfc, dst, src, flags);
         } else {
             av_log(hwfc, AV_LOG_ERROR, "Vulkan: DRM modifier extensions required for QSV interop\n");
+            av_log(hwfc, AV_LOG_INFO, "QSV->Vulkan zero-copy unavailable on this platform\n");
+            av_log(hwfc, AV_LOG_INFO, "Use: -vf 'hwdownload,format=nv12,hwupload=derive_device=vulkan' as fallback\n");
             return AVERROR(ENOSYS);
         }
 #endif
     case AV_PIX_FMT_DRM_PRIME:
         if (p->vkctx.extensions & FF_VK_EXT_DRM_MODIFIER_FLAGS)
             return vulkan_map_from_drm(hwfc, dst, src, flags);
-        else
+        else {
+            av_log(hwfc, AV_LOG_INFO, "Vulkan: DRM modifier extensions not available\n");
             return AVERROR(ENOSYS);
+        }
 #endif
     default:
         return AVERROR(ENOSYS);
@@ -4255,14 +4262,18 @@ static int vulkan_map_from(AVHWFramesContext *hwfc, AVFrame *dst,
     case AV_PIX_FMT_DRM_PRIME:
         if (p->vkctx.extensions & FF_VK_EXT_DRM_MODIFIER_FLAGS)
             return vulkan_map_to_drm(hwfc, dst, src, flags);
-        else
+        else {
+            av_log(hwfc, AV_LOG_INFO, "Vulkan: DRM modifier extensions not available\n");
             return AVERROR(ENOSYS);
+        }
 #if CONFIG_VAAPI
     case AV_PIX_FMT_VAAPI:
         if (p->vkctx.extensions & FF_VK_EXT_DRM_MODIFIER_FLAGS)
             return vulkan_map_to_vaapi(hwfc, dst, src, flags);
-        else
+        else {
+            av_log(hwfc, AV_LOG_INFO, "Vulkan: DRM modifier extensions not available for VAAPI interop\n");
             return AVERROR(ENOSYS);
+        }
 #endif
 #if CONFIG_QSV
     case AV_PIX_FMT_QSV:
@@ -4271,6 +4282,8 @@ static int vulkan_map_from(AVHWFramesContext *hwfc, AVFrame *dst,
             return vulkan_map_to_qsv(hwfc, dst, src, flags);
         } else {
             av_log(hwfc, AV_LOG_ERROR, "Vulkan: DRM modifier extensions required for QSV interop\n");
+            av_log(hwfc, AV_LOG_INFO, "Vulkan->QSV zero-copy unavailable on this platform\n");
+            av_log(hwfc, AV_LOG_INFO, "Use: -vf 'hwdownload,format=nv12,hwupload=derive_device=qsv' as fallback\n");
             return AVERROR(ENOSYS);
         }
 #endif
