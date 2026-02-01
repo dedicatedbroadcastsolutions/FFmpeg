@@ -1613,6 +1613,10 @@ static int qsv_frames_derive_from(AVHWFramesContext *dst_ctx,
 }
 
 #if CONFIG_VAAPI && CONFIG_LIBDRM
+/* Forward declaration */
+static int qsv_map_from(AVHWFramesContext *ctx,
+                        AVFrame *dst, const AVFrame *src, int flags);
+
 /**
  * Map QSV frame to DRM PRIME for Vulkan interop
  * This enables zero-copy QSV decode -> Vulkan filter pipeline
