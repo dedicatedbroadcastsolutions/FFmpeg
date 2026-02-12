@@ -145,6 +145,9 @@ static const struct {
     { AV_PIX_FMT_NV12, MFX_FOURCC_NV12, 0 },
     { AV_PIX_FMT_BGRA, MFX_FOURCC_RGB4, 0 },
     { AV_PIX_FMT_P010, MFX_FOURCC_P010, 1 },
+#ifdef MFX_FOURCC_P210
+    { AV_PIX_FMT_P210, MFX_FOURCC_P210, 1 },
+#endif
     { AV_PIX_FMT_PAL8, MFX_FOURCC_P8,   0 },
     { AV_PIX_FMT_YUYV422,
                        MFX_FOURCC_YUY2, 0 },

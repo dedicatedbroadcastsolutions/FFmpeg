@@ -2099,6 +2099,41 @@ static int vulkan_device_create(AVHWDeviceContext *ctx, const char *device,
     return vulkan_device_create_internal(ctx, &dev_select, 0, opts, flags);
 }
 
+#if CONFIG_VAAPI
+static int vulkan_device_derive_from_va_display(AVHWDeviceContext *ctx,
+                                                VADisplay dpy,
+                                                AVDictionary *opts, int flags)
+{
+    av_unused VulkanDeviceSelection dev_select = { 0 };
+#if VA_CHECK_VERSION(1, 15, 0)
+    VAStatus vas;
+    VADisplayAttribute attr = {
+        .type = VADisplayPCIID,
+    };
+#endif
+    const char *vendor;
+
+#if VA_CHECK_VERSION(1, 15, 0)
+    vas = vaGetDisplayAttributes(dpy, &attr, 1);
+    if (vas == VA_STATUS_SUCCESS && attr.flags != VA_DISPLAY_ATTRIB_NOT_SUPPORTED)
+        dev_select.pci_device = (attr.value & 0xFFFF);
+#endif
+
+    if (!dev_select.pci_device) {
+        vendor = vaQueryVendorString(dpy);
+        if (!vendor) {
+            av_log(ctx, AV_LOG_ERROR, "Unable to get device info from VAAPI!\n");
+            return AVERROR_EXTERNAL;
+        }
+
+        if (strstr(vendor, "AMD"))
+            dev_select.vendor_id = 0x1002;
+    }
+
+    return vulkan_device_create_internal(ctx, &dev_select, 0, opts, flags);
+}
+#endif
+
 static int vulkan_device_derive(AVHWDeviceContext *ctx,
                                 AVHWDeviceContext *src_ctx,
                                 AVDictionary *opts, int flags)
@@ -2112,33 +2147,29 @@ static int vulkan_device_derive(AVHWDeviceContext *ctx,
 #if CONFIG_VAAPI
     case AV_HWDEVICE_TYPE_VAAPI: {
         AVVAAPIDeviceContext *src_hwctx = src_ctx->hwctx;
-        VADisplay dpy = src_hwctx->display;
-#if VA_CHECK_VERSION(1, 15, 0)
-        VAStatus vas;
-        VADisplayAttribute attr = {
-            .type = VADisplayPCIID,
-        };
+        return vulkan_device_derive_from_va_display(ctx, src_hwctx->display,
+                                                    opts, flags);
+    }
 #endif
-        const char *vendor;
+#if CONFIG_QSV && CONFIG_VAAPI
+    case AV_HWDEVICE_TYPE_QSV: {
+        AVQSVDeviceContext *src_hwctx = src_ctx->hwctx;
+        mfxHDL handle = NULL;
+        mfxStatus sts;
 
-#if VA_CHECK_VERSION(1, 15, 0)
-        vas = vaGetDisplayAttributes(dpy, &attr, 1);
-        if (vas == VA_STATUS_SUCCESS && attr.flags != VA_DISPLAY_ATTRIB_NOT_SUPPORTED)
-            dev_select.pci_device = (attr.value & 0xFFFF);
-#endif
-
-        if (!dev_select.pci_device) {
-            vendor = vaQueryVendorString(dpy);
-            if (!vendor) {
-                av_log(ctx, AV_LOG_ERROR, "Unable to get device info from VAAPI!\n");
-                return AVERROR_EXTERNAL;
-            }
-
-            if (strstr(vendor, "AMD"))
-                dev_select.vendor_id = 0x1002;
+        if (!src_hwctx || !src_hwctx->session) {
+            av_log(ctx, AV_LOG_ERROR, "QSV device has no active session for derivation.\n");
+            return AVERROR(EINVAL);
         }
 
-        return vulkan_device_create_internal(ctx, &dev_select, 0, opts, flags);
+        sts = MFXVideoCORE_GetHandle(src_hwctx->session, MFX_HANDLE_VA_DISPLAY, &handle);
+        if (sts != MFX_ERR_NONE || !handle) {
+            av_log(ctx, AV_LOG_ERROR, "QSV device does not expose a VA display handle.\n");
+            return AVERROR(ENOSYS);
+        }
+
+        return vulkan_device_derive_from_va_display(ctx, (VADisplay)handle,
+                                                    opts, flags);
     }
 #endif
 #if CONFIG_LIBDRM
@@ -3148,6 +3179,9 @@ static const struct {
     { DRM_FORMAT_ABGR2101010, VK_FORMAT_A2R10G10B10_UNORM_PACK32 },
     { DRM_FORMAT_XRGB2101010, VK_FORMAT_A2B10G10R10_UNORM_PACK32 },
     { DRM_FORMAT_XBGR2101010, VK_FORMAT_A2R10G10B10_UNORM_PACK32 },
+#ifdef DRM_FORMAT_P210
+    { DRM_FORMAT_P210, VK_FORMAT_G10X6_B10X6R10X6_2PLANE_422_UNORM_3PACK16 },
+#endif
     { DRM_FORMAT_Y210, VK_FORMAT_G10X6B10X6G10X6R10X6_422_UNORM_4PACK16 },
     { DRM_FORMAT_Y212, VK_FORMAT_G12X4B12X4G12X4R12X4_422_UNORM_4PACK16 },
     { DRM_FORMAT_Y216, VK_FORMAT_G16B16G16R16_422_UNORM },
@@ -3192,6 +3226,10 @@ static const char *vk_format_name(VkFormat fmt)
         return "VK_FORMAT_R12X4G12X4B12X4A12X4_UNORM_4PACK16";
     case VK_FORMAT_R16G16B16A16_UNORM:
         return "VK_FORMAT_R16G16B16A16_UNORM";
+#ifdef VK_FORMAT_G10X6_B10X6R10X6_2PLANE_422_UNORM_3PACK16
+    case VK_FORMAT_G10X6_B10X6R10X6_2PLANE_422_UNORM_3PACK16:
+        return "VK_FORMAT_G10X6_B10X6R10X6_2PLANE_422_UNORM_3PACK16";
+#endif
 #ifdef VK_FORMAT_G10X6_B10X6_R10X6_2PLANE_422_UNORM_3PACK16
     case VK_FORMAT_G10X6_B10X6_R10X6_2PLANE_422_UNORM_3PACK16:
         return "VK_FORMAT_G10X6_B10X6_R10X6_2PLANE_422_UNORM_3PACK16";
