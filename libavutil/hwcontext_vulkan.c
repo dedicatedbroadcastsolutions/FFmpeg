@@ -2369,8 +2369,24 @@ static void vulkan_frame_free(AVHWFramesContext *hwfc, AVVkFrame *f)
 
     for (int i = 0; i < nb_images; i++) {
         vk->DestroyImage(hwctx->act_dev,     f->img[i], hwctx->alloc);
-        vk->FreeMemory(hwctx->act_dev,       f->mem[i], hwctx->alloc);
         vk->DestroySemaphore(hwctx->act_dev, f->sem[i], hwctx->alloc);
+    }
+
+    for (int i = 0; i < FF_ARRAY_ELEMS(f->mem); i++) {
+        int already_freed = 0;
+
+        if (!f->mem[i])
+            continue;
+
+        for (int j = 0; j < i; j++) {
+            if (f->mem[j] == f->mem[i]) {
+                already_freed = 1;
+                break;
+            }
+        }
+
+        if (!already_freed)
+            vk->FreeMemory(hwctx->act_dev, f->mem[i], hwctx->alloc);
     }
 
     av_free(f);
@@ -3150,6 +3166,38 @@ static inline VkFormat drm_to_vulkan_fmt(uint32_t drm_fourcc)
     return VK_FORMAT_UNDEFINED;
 }
 
+static const char *vk_format_name(VkFormat fmt)
+{
+    switch (fmt) {
+    case VK_FORMAT_R8_UNORM:
+        return "VK_FORMAT_R8_UNORM";
+    case VK_FORMAT_R16_UNORM:
+        return "VK_FORMAT_R16_UNORM";
+    case VK_FORMAT_R8G8_UNORM:
+        return "VK_FORMAT_R8G8_UNORM";
+    case VK_FORMAT_R16G16_UNORM:
+        return "VK_FORMAT_R16G16_UNORM";
+    case VK_FORMAT_B8G8R8A8_UNORM:
+        return "VK_FORMAT_B8G8R8A8_UNORM";
+    case VK_FORMAT_R8G8B8A8_UNORM:
+        return "VK_FORMAT_R8G8B8A8_UNORM";
+    case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
+        return "VK_FORMAT_A2B10G10R10_UNORM_PACK32";
+    case VK_FORMAT_A2R10G10B10_UNORM_PACK32:
+        return "VK_FORMAT_A2R10G10B10_UNORM_PACK32";
+    case VK_FORMAT_R12X4G12X4B12X4A12X4_UNORM_4PACK16:
+        return "VK_FORMAT_R12X4G12X4B12X4A12X4_UNORM_4PACK16";
+    case VK_FORMAT_R16G16B16A16_UNORM:
+        return "VK_FORMAT_R16G16B16A16_UNORM";
+#ifdef VK_FORMAT_G10X6_B10X6_R10X6_2PLANE_422_UNORM_3PACK16
+    case VK_FORMAT_G10X6_B10X6_R10X6_2PLANE_422_UNORM_3PACK16:
+        return "VK_FORMAT_G10X6_B10X6_R10X6_2PLANE_422_UNORM_3PACK16";
+#endif
+    default:
+        return "VK_FORMAT_UNDEFINED";
+    }
+}
+
 static int vulkan_map_from_drm_frame_desc(AVHWFramesContext *hwfc, AVVkFrame **frame,
                                           const AVFrame *src, int flags)
 {
@@ -3164,6 +3212,27 @@ static int vulkan_map_from_drm_frame_desc(AVHWFramesContext *hwfc, AVVkFrame **f
     const AVDRMFrameDescriptor *desc = (AVDRMFrameDescriptor *)src->data[0];
     VkBindImageMemoryInfo bind_info[AV_DRM_MAX_PLANES];
     VkBindImagePlaneMemoryInfo plane_info[AV_DRM_MAX_PLANES];
+    VkDeviceMemory obj_mem[AV_DRM_MAX_PLANES] = { 0 };
+    int obj_imported[AV_DRM_MAX_PLANES] = { 0 };
+
+    if (desc->nb_objects > AV_DRM_MAX_PLANES) {
+        av_log(ctx, AV_LOG_ERROR, "Too many DRM objects (%d) for import.\n",
+               desc->nb_objects);
+        return AVERROR(EINVAL);
+    }
+
+    av_log(ctx, AV_LOG_VERBOSE, "DRM import: nb_objects=%d nb_layers=%d\n",
+           desc->nb_objects, desc->nb_layers);
+    for (int i = 0; i < desc->nb_objects; i++) {
+        av_log(ctx, AV_LOG_VERBOSE, "DRM object[%d] modifier=0x%016llx\n",
+               i, (unsigned long long)desc->objects[i].format_modifier);
+    }
+    for (int i = 0; i < desc->nb_layers; i++) {
+        for (int j = 0; j < desc->layers[i].nb_planes; j++) {
+            av_log(ctx, AV_LOG_VERBOSE, "DRM layer[%d] plane[%d] offset=%td\n",
+                   i, j, desc->layers[i].planes[j].offset);
+        }
+    }
 
     for (int i = 0; i < desc->nb_layers; i++) {
         if (drm_to_vulkan_fmt(desc->layers[i].format) == VK_FORMAT_UNDEFINED) {
@@ -3183,6 +3252,42 @@ static int vulkan_map_from_drm_frame_desc(AVHWFramesContext *hwfc, AVVkFrame **f
 
     for (int i = 0; i < desc->nb_layers; i++) {
         const int planes = desc->layers[i].nb_planes;
+        int first_obj_index;
+        uint64_t layer_modifier;
+
+        if (planes <= 0) {
+            av_log(ctx, AV_LOG_ERROR, "Invalid plane count for layer %d\n", i);
+            err = AVERROR(EINVAL);
+            goto fail;
+        }
+
+        first_obj_index = desc->layers[i].planes[0].object_index;
+        if (first_obj_index < 0 || first_obj_index >= desc->nb_objects) {
+            av_log(ctx, AV_LOG_ERROR, "Invalid object index %d for layer %d\n",
+                   first_obj_index, i);
+            err = AVERROR(EINVAL);
+            goto fail;
+        }
+
+        layer_modifier = desc->objects[first_obj_index].format_modifier;
+        for (int j = 0; j < planes; j++) {
+            const int obj_index = desc->layers[i].planes[j].object_index;
+            if (obj_index < 0 || obj_index >= desc->nb_objects) {
+                av_log(ctx, AV_LOG_ERROR, "Invalid object index %d for layer %d plane %d\n",
+                       obj_index, i, j);
+                err = AVERROR(EINVAL);
+                goto fail;
+            }
+            if (desc->objects[obj_index].format_modifier != layer_modifier) {
+                av_log(ctx, AV_LOG_ERROR,
+                       "Mismatched DRM modifiers in layer %d: object %d has 0x%016llx (expected 0x%016llx)\n",
+                       i, obj_index,
+                       (unsigned long long)desc->objects[obj_index].format_modifier,
+                       (unsigned long long)layer_modifier);
+                err = AVERROR(EINVAL);
+                goto fail;
+            }
+        }
 
         /* Semaphore */
         VkSemaphoreTypeCreateInfo sem_type_info = {
@@ -3199,7 +3304,7 @@ static int vulkan_map_from_drm_frame_desc(AVHWFramesContext *hwfc, AVVkFrame **f
         VkSubresourceLayout ext_img_layouts[AV_DRM_MAX_PLANES];
         VkImageDrmFormatModifierExplicitCreateInfoEXT ext_img_mod_spec = {
             .sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT,
-            .drmFormatModifier = desc->objects[0].format_modifier,
+            .drmFormatModifier = layer_modifier,
             .drmFormatModifierPlaneCount = planes,
             .pPlaneLayouts = (const VkSubresourceLayout *)&ext_img_layouts,
         };
@@ -3216,7 +3321,7 @@ static int vulkan_map_from_drm_frame_desc(AVHWFramesContext *hwfc, AVVkFrame **f
             .extent.depth          = 1,
             .mipLevels             = 1,
             .arrayLayers           = 1,
-            .flags                 = 0x0,
+            .flags                 = (planes > 1) ? VK_IMAGE_CREATE_DISJOINT_BIT : 0x0,
             .tiling                = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
             .initialLayout         = VK_IMAGE_LAYOUT_UNDEFINED, /* specs say so */
             .usage                 = 0x0, /* filled in below */
@@ -3226,6 +3331,12 @@ static int vulkan_map_from_drm_frame_desc(AVHWFramesContext *hwfc, AVVkFrame **f
             .sharingMode           = p->nb_img_qfs > 1 ? VK_SHARING_MODE_CONCURRENT :
                                                          VK_SHARING_MODE_EXCLUSIVE,
         };
+
+        if (layer_modifier == I915_FORMAT_MOD_4_TILED)
+            create_info.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
+
+        av_log(ctx, AV_LOG_VERBOSE, "DRM layer[%d] Vulkan format: %s (%d)\n",
+               i, vk_format_name(create_info.format), create_info.format);
 
         /* Image format verification */
         VkExternalImageFormatProperties ext_props = {
@@ -3315,67 +3426,84 @@ static int vulkan_map_from_drm_frame_desc(AVHWFramesContext *hwfc, AVVkFrame **f
     }
 
     for (int i = 0; i < desc->nb_layers; i++) {
-        /* Memory requirements */
-        VkImageMemoryRequirementsInfo2 req_desc = {
-            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2,
-            .image = f->img[i],
-        };
-        VkMemoryDedicatedRequirements ded_req = {
-            .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS,
-        };
-        VkMemoryRequirements2 req2 = {
-            .sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2,
-            .pNext = &ded_req,
-        };
+        const int planes = desc->layers[i].nb_planes;
 
-        /* Allocation/importing */
-        VkMemoryFdPropertiesKHR fdmp = {
-            .sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR,
-        };
-        /* This assumes that a layer will never be constructed from multiple
-         * objects. If that was to happen in the real world, this code would
-         * need to import each plane separately.
-         */
-        VkImportMemoryFdInfoKHR idesc = {
-            .sType      = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
-            .fd         = dup(desc->objects[desc->layers[i].planes[0].object_index].fd),
-            .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
-        };
-        VkMemoryDedicatedAllocateInfo ded_alloc = {
-            .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
-            .pNext = &idesc,
-            .image = req_desc.image,
-        };
+        for (int j = 0; j < planes; j++) {
+            const int obj_index = desc->layers[i].planes[j].object_index;
+            const VkImageAspectFlagBits aspect = j == 0 ? VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT :
+                                                j == 1 ? VK_IMAGE_ASPECT_MEMORY_PLANE_1_BIT_EXT :
+                                                j == 2 ? VK_IMAGE_ASPECT_MEMORY_PLANE_2_BIT_EXT :
+                                                         VK_IMAGE_ASPECT_MEMORY_PLANE_3_BIT_EXT;
+            VkImagePlaneMemoryRequirementsInfo plane_req = {
+                .sType = VK_STRUCTURE_TYPE_IMAGE_PLANE_MEMORY_REQUIREMENTS_INFO,
+                .planeAspect = aspect,
+            };
+            VkImageMemoryRequirementsInfo2 req_desc = {
+                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2,
+                .pNext = planes > 1 ? &plane_req : NULL,
+                .image = f->img[i],
+            };
+            VkMemoryDedicatedRequirements ded_req = {
+                .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS,
+            };
+            VkMemoryRequirements2 req2 = {
+                .sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2,
+                .pNext = &ded_req,
+            };
+            if (obj_index < 0 || obj_index >= desc->nb_objects) {
+                av_log(hwfc, AV_LOG_ERROR, "Invalid object index %d for layer %d plane %d\n",
+                       obj_index, i, j);
+                err = AVERROR(EINVAL);
+                goto fail;
+            }
 
-        /* Get object properties */
-        ret = vk->GetMemoryFdPropertiesKHR(hwctx->act_dev,
-                                           VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
-                                           idesc.fd, &fdmp);
-        if (ret != VK_SUCCESS) {
-            av_log(hwfc, AV_LOG_ERROR, "Failed to get FD properties: %s\n",
-                   ff_vk_ret2str(ret));
-            err = AVERROR_EXTERNAL;
-            close(idesc.fd);
-            goto fail;
+            if (obj_imported[obj_index])
+                continue;
+
+            VkMemoryFdPropertiesKHR fdmp = {
+                .sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR,
+            };
+            VkImportMemoryFdInfoKHR idesc = {
+                .sType      = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
+                .fd         = dup(desc->objects[obj_index].fd),
+                .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+            };
+            VkMemoryDedicatedAllocateInfo ded_alloc = {
+                .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
+                .pNext = &idesc,
+                .image = req_desc.image,
+            };
+
+            ret = vk->GetMemoryFdPropertiesKHR(hwctx->act_dev,
+                                               VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+                                               idesc.fd, &fdmp);
+            if (ret != VK_SUCCESS) {
+                av_log(hwfc, AV_LOG_ERROR, "Failed to get FD properties: %s\n",
+                       ff_vk_ret2str(ret));
+                err = AVERROR_EXTERNAL;
+                close(idesc.fd);
+                goto fail;
+            }
+
+            vk->GetImageMemoryRequirements2(hwctx->act_dev, &req_desc, &req2);
+
+            req2.memoryRequirements.memoryTypeBits = fdmp.memoryTypeBits;
+
+            err = alloc_mem(ctx, &req2.memoryRequirements,
+                            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                            (ded_req.prefersDedicatedAllocation ||
+                             ded_req.requiresDedicatedAllocation) ?
+                                &ded_alloc : ded_alloc.pNext,
+                            &f->flags, &obj_mem[obj_index]);
+            if (err) {
+                close(idesc.fd);
+                return err;
+            }
+
+            obj_imported[obj_index] = 1;
+            f->mem[obj_index] = obj_mem[obj_index];
+            f->size[obj_index] = req2.memoryRequirements.size;
         }
-
-        vk->GetImageMemoryRequirements2(hwctx->act_dev, &req_desc, &req2);
-
-        /* Only a single bit must be set, not a range, and it must match */
-        req2.memoryRequirements.memoryTypeBits = fdmp.memoryTypeBits;
-
-        err = alloc_mem(ctx, &req2.memoryRequirements,
-                        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-                        (ded_req.prefersDedicatedAllocation ||
-                         ded_req.requiresDedicatedAllocation) ?
-                            &ded_alloc : ded_alloc.pNext,
-                        &f->flags, &f->mem[i]);
-        if (err) {
-            close(idesc.fd);
-            return err;
-        }
-
-        f->size[i] = req2.memoryRequirements.size;
     }
 
     for (int i = 0; i < desc->nb_layers; i++) {
@@ -3383,7 +3511,16 @@ static int vulkan_map_from_drm_frame_desc(AVHWFramesContext *hwfc, AVVkFrame **f
         for (int j = 0; j < planes; j++) {
             VkImageAspectFlagBits aspect = j == 0 ? VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT :
                                            j == 1 ? VK_IMAGE_ASPECT_MEMORY_PLANE_1_BIT_EXT :
-                                                    VK_IMAGE_ASPECT_MEMORY_PLANE_2_BIT_EXT;
+                                           j == 2 ? VK_IMAGE_ASPECT_MEMORY_PLANE_2_BIT_EXT :
+                                                    VK_IMAGE_ASPECT_MEMORY_PLANE_3_BIT_EXT;
+            const int obj_index = desc->layers[i].planes[j].object_index;
+
+            if (obj_index < 0 || obj_index >= desc->nb_objects || !obj_mem[obj_index]) {
+                av_log(ctx, AV_LOG_ERROR, "Missing imported memory for layer %d plane %d (object %d)\n",
+                       i, j, obj_index);
+                err = AVERROR(EINVAL);
+                goto fail;
+            }
 
             plane_info[bind_counts].sType = VK_STRUCTURE_TYPE_BIND_IMAGE_PLANE_MEMORY_INFO;
             plane_info[bind_counts].pNext = NULL;
@@ -3392,7 +3529,7 @@ static int vulkan_map_from_drm_frame_desc(AVHWFramesContext *hwfc, AVVkFrame **f
             bind_info[bind_counts].sType  = VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO;
             bind_info[bind_counts].pNext  = planes > 1 ? &plane_info[bind_counts] : NULL;
             bind_info[bind_counts].image  = f->img[i];
-            bind_info[bind_counts].memory = f->mem[i];
+            bind_info[bind_counts].memory = obj_mem[obj_index];
 
             /* Offset is already signalled via pPlaneLayouts above */
             bind_info[bind_counts].memoryOffset = 0;
