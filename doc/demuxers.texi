@@ -1053,6 +1053,25 @@ MJPEG stream. Turning this option on by setting it to 1 will result in a stricte
 of the boundary value.
 @end table
 
+@section omt
+
+Open Media Transport (OMT) TCP demuxer.
+
+This demuxer connects directly to an OMT sender by host and port. The OMT
+discovery protocols are not implemented. Use @code{-f omt} and an input URL of
+the form @code{omt://@var{host}:@var{port}}.
+
+@table @option
+@item channel
+Select the separate OMT media connection to receive, either @code{video}
+(default) or @code{audio}.
+@end table
+
+The initial implementation supports raw UYVY, YUY2, BGRA, NV12, YV12, and
+P216 video, 8-bit progressive VMX1 video through the @code{vmix} decoder, and
+FPA1 planar floating-point audio. It does not support output/muxing, discovery,
+interlaced/preview video, alpha-bearing OMT frames, or high-bit-depth VMX1.
+
 @section rawvideo
 
 Raw video demuxer.

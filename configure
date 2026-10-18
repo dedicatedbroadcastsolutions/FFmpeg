@@ -3888,6 +3888,7 @@ videotoolbox_deps="corefoundation coremedia corevideo VTDecompressionSessionDeco
 videotoolbox_encoder_deps="videotoolbox VTCompressionSessionPrepareToEncodeFrames"
 
 # demuxers / muxers
+omt_demuxer_select="network"
 ac3_demuxer_select="ac3_parser"
 act_demuxer_select="riffdec"
 adts_muxer_select="mpeg4audio"
