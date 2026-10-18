@@ -7,6 +7,11 @@ fate-api-flac: $(APITESTSDIR)/api-flac-test$(EXESUF)
 fate-api-flac: CMD = run $(APITESTSDIR)/api-flac-test$(EXESUF)
 fate-api-flac: CMP = null
 
+FATE_API_LIBAVCODEC-$(CONFIG_VMIX_DECODER) += fate-api-vmix
+fate-api-vmix: $(APITESTSDIR)/api-vmix-test$(EXESUF)
+fate-api-vmix: CMD = run $(APITESTSDIR)/api-vmix-test$(EXESUF)
+fate-api-vmix: CMP = null
+
 FATE_API_LIBAVCODEC-$(CONFIG_MOVTEXT_ENCODER) += fate-api-movtext
 fate-api-movtext: $(APITESTSDIR)/api-movtext-test$(EXESUF)
 fate-api-movtext: CMD = run $(APITESTSDIR)/api-movtext-test$(EXESUF)
