@@ -3369,9 +3369,9 @@ the corresponding @code{omt://@var{host}:@var{port}} input URL. Audio and video
 use separate receiver connections to the same port.
 
 The muxer supports raw UYVY, YUY2, BGRA, NV12, YV12, and P216 video, 8-bit VMX1
-packets, and PCM_F32LE audio (sent as OMT FPA1). It currently serves one
-receiver session, does not implement OMT discovery or multi-receiver fan-out,
-and does not encode VMX1.
+packets, and PCM_F32LE audio (sent as OMT FPA1). It supports fan-out to up to
+64 receiver channel connections. OMT discovery and VMX1 encoding are not
+implemented.
 
 @table @option
 @item listen_timeout

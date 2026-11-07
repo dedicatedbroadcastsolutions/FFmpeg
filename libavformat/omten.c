@@ -19,6 +19,7 @@
  */
 
 #include <string.h>
+#include <stdatomic.h>
 
 #include "config_components.h"
 
@@ -30,6 +31,7 @@
 #include "libavutil/internal.h"
 #include "libavutil/mem.h"
 #include "libavutil/opt.h"
+#include "libavutil/thread.h"
 
 #include "avformat.h"
 #include "internal.h"
@@ -41,6 +43,8 @@
 #define OMT_AUDIO_HEADER_SIZE 24
 #define OMT_TIME_BASE 10000000
 #define OMT_MAX_FRAME_SIZE (256 * 1024 * 1024)
+#define OMT_MAX_RECEIVERS 64
+#define OMT_CLIENT_TIMEOUT (5 * AV_TIME_BASE)
 
 enum OMTChannel {
     OMT_CHANNEL_VIDEO,
@@ -51,23 +55,25 @@ enum OMTChannel {
 typedef struct OMTMuxContext {
     const AVClass *class;
     URLContext *listener;
-    URLContext *receiver[OMT_CHANNEL_COUNT];
+    struct OMTReceiver *receivers;
+    AVMutex receiver_lock;
+    pthread_t accept_thread;
+    atomic_int exiting;
+    int receiver_count;
+    int lock_initialized;
+    int thread_started;
     int stream_index[OMT_CHANNEL_COUNT];
-    int listen_timeout;
 } OMTMuxContext;
 
-#define OFFSET(x) offsetof(OMTMuxContext, x)
-#define E AV_OPT_FLAG_ENCODING_PARAM
-static const AVOption omt_mux_options[] = {
-    { "listen_timeout", "receiver connection timeout in milliseconds", OFFSET(listen_timeout),
-      AV_OPT_TYPE_INT, { .i64 = 30000 }, 1, INT_MAX, E },
-    { NULL }
-};
+typedef struct OMTReceiver {
+    URLContext *tcp;
+    int channel;
+    struct OMTReceiver *next;
+} OMTReceiver;
 
 static const AVClass omt_mux_class = {
     .class_name = "omt muxer",
     .item_name  = av_default_item_name,
-    .option     = omt_mux_options,
     .version    = LIBAVUTIL_VERSION_INT,
 };
 
@@ -156,7 +162,7 @@ static int omt_open_listener(AVFormatContext *ctx)
         return AVERROR(EINVAL);
     }
     ret = ff_url_join(tcp_url, sizeof(tcp_url), "tcp", NULL, hostname, port,
-                      "?listen=2&listen_timeout=%d", s->listen_timeout);
+                      "?listen=2&listen_timeout=10&timeout=5000000");
     if (ret < 0 || ret >= sizeof(tcp_url))
         return AVERROR(EINVAL);
     return ffurl_open_whitelist(&s->listener, tcp_url, AVIO_FLAG_READ_WRITE,
@@ -164,36 +170,56 @@ static int omt_open_listener(AVFormatContext *ctx)
                                 ctx->protocol_whitelist, ctx->protocol_blacklist, NULL);
 }
 
-static int omt_accept_receivers(AVFormatContext *ctx)
+static void *omt_accept_thread(void *arg)
 {
+    AVFormatContext *ctx = arg;
     OMTMuxContext *s = ctx->priv_data;
-    int required = 0;
 
-    for (int i = 0; i < OMT_CHANNEL_COUNT; i++)
-        required += s->stream_index[i] >= 0;
-
-    for (int accepted = 0; accepted < required; ) {
+    while (!atomic_load(&s->exiting)) {
         URLContext *client = NULL;
         int channel, ret = ffurl_accept(s->listener, &client);
         if (ret < 0) {
-            if (accepted && ret == AVERROR(ETIMEDOUT))
-                break;
-            return ret;
+            if (ret == AVERROR(ETIMEDOUT))
+                continue;
+            if (!atomic_load(&s->exiting))
+                av_log(ctx, AV_LOG_WARNING, "OMT receiver accept failed: %s\n",
+                       av_err2str(ret));
+            break;
         }
+        av_opt_set_int(client, "rw_timeout", OMT_CLIENT_TIMEOUT,
+                       AV_OPT_SEARCH_CHILDREN);
         ret = omt_read_subscription(client, &channel);
         if (ret < 0) {
             ffurl_closep(&client);
-            return ret;
+            continue;
         }
-        if (s->stream_index[channel] < 0 || s->receiver[channel]) {
+        if (s->stream_index[channel] < 0) {
             ffurl_closep(&client);
             continue;
         }
-        s->receiver[channel] = client;
-        accepted++;
+        OMTReceiver *receiver = av_mallocz(sizeof(*receiver));
+        if (!receiver) {
+            ffurl_closep(&client);
+            continue;
+        }
+        receiver->tcp = client;
+        receiver->channel = channel;
+        ff_mutex_lock(&s->receiver_lock);
+        if (s->receiver_count >= OMT_MAX_RECEIVERS) {
+            ff_mutex_unlock(&s->receiver_lock);
+            ffurl_closep(&receiver->tcp);
+            av_free(receiver);
+            continue;
+        }
+        receiver->next = s->receivers;
+        s->receivers = receiver;
+        s->receiver_count++;
+        ff_mutex_unlock(&s->receiver_lock);
     }
-    return 0;
+    return NULL;
 }
+
+static void omt_close(AVFormatContext *ctx);
 
 static int omt_write_header(AVFormatContext *ctx)
 {
@@ -220,17 +246,21 @@ static int omt_write_header(AVFormatContext *ctx)
         s->stream_index[channel] = i;
     }
 
-    if ((ret = omt_open_listener(ctx)) < 0 ||
-        (ret = omt_accept_receivers(ctx)) < 0) {
-        for (int i = 0; i < OMT_CHANNEL_COUNT; i++)
-            ffurl_closep(&s->receiver[i]);
-        ffurl_closep(&s->listener);
+    if ((ret = omt_open_listener(ctx)) < 0)
         return ret;
-    }
-    if (!s->receiver[OMT_CHANNEL_VIDEO] && !s->receiver[OMT_CHANNEL_AUDIO]) {
+    ret = ff_mutex_init(&s->receiver_lock, NULL);
+    if (ret) {
         ffurl_closep(&s->listener);
-        return AVERROR(ETIMEDOUT);
+        return AVERROR(ret);
     }
+    s->lock_initialized = 1;
+    atomic_init(&s->exiting, 0);
+    ret = pthread_create(&s->accept_thread, NULL, omt_accept_thread, ctx);
+    if (ret) {
+        omt_close(ctx);
+        return AVERROR(ret);
+    }
+    s->thread_started = 1;
     return 0;
 }
 
@@ -301,20 +331,15 @@ static int omt_write_packet(AVFormatContext *ctx, AVPacket *pkt)
     AVStream *st = ctx->streams[pkt->stream_index];
     AVCodecParameters *par = st->codecpar;
     int channel = par->codec_type == AVMEDIA_TYPE_VIDEO ? OMT_CHANNEL_VIDEO : OMT_CHANNEL_AUDIO;
-    URLContext *client = s->receiver[channel];
     uint8_t extended[OMT_VIDEO_HEADER_SIZE];
     int64_t pts = pkt->pts != AV_NOPTS_VALUE ? pkt->pts : pkt->dts;
     int ret;
 
-    if (!client)
-        return 0;
     pts = pts == AV_NOPTS_VALUE ? 0 : av_rescale_q(pts, st->time_base,
                                                    (AVRational){ 1, OMT_TIME_BASE });
     if (channel == OMT_CHANNEL_VIDEO) {
         if ((ret = omt_video_header(ctx, st, extended)) < 0)
             return ret;
-        return omt_write_frame(client, 2, pts, extended, sizeof(extended),
-                               pkt->data, pkt->size);
     } else {
         int channels = par->ch_layout.nb_channels;
         int samples;
@@ -342,17 +367,76 @@ static int omt_write_packet(AVFormatContext *ctx, AVPacket *pkt)
         AV_WL32(header + 8, samples);
         AV_WL32(header + 12, channels);
         AV_WL32(header + 16, channels == 32 ? UINT32_MAX : (1U << channels) - 1);
-        ret = omt_write_frame(client, 4, pts, header, sizeof(header), planar, planar_size);
+        ff_mutex_lock(&s->receiver_lock);
+        OMTReceiver **next = &s->receivers;
+        while (*next) {
+            OMTReceiver *receiver = *next;
+            if (receiver->channel == channel) {
+                ret = omt_write_frame(receiver->tcp, 4, pts, header, sizeof(header),
+                                      planar, planar_size);
+                if (ret < 0) {
+                    av_log(ctx, AV_LOG_WARNING, "Removing OMT audio receiver: %s\n",
+                           av_err2str(ret));
+                    *next = receiver->next;
+                    ffurl_closep(&receiver->tcp);
+                    av_free(receiver);
+                    s->receiver_count--;
+                    continue;
+                }
+            }
+            next = &receiver->next;
+        }
+        ff_mutex_unlock(&s->receiver_lock);
         av_free(planar);
-        return ret;
+        return 0;
     }
+
+    ff_mutex_lock(&s->receiver_lock);
+    OMTReceiver **next = &s->receivers;
+    while (*next) {
+        OMTReceiver *receiver = *next;
+        if (receiver->channel == channel) {
+            ret = omt_write_frame(receiver->tcp, 2, pts, extended, sizeof(extended),
+                                  pkt->data, pkt->size);
+            if (ret < 0) {
+                av_log(ctx, AV_LOG_WARNING, "Removing OMT video receiver: %s\n",
+                       av_err2str(ret));
+                *next = receiver->next;
+                ffurl_closep(&receiver->tcp);
+                av_free(receiver);
+                s->receiver_count--;
+                continue;
+            }
+        }
+        next = &receiver->next;
+    }
+    ff_mutex_unlock(&s->receiver_lock);
+    return 0;
 }
 
 static void omt_close(AVFormatContext *ctx)
 {
     OMTMuxContext *s = ctx->priv_data;
-    for (int i = 0; i < OMT_CHANNEL_COUNT; i++)
-        ffurl_closep(&s->receiver[i]);
+    if (s->thread_started) {
+        atomic_store(&s->exiting, 1);
+        pthread_join(s->accept_thread, NULL);
+        s->thread_started = 0;
+    }
+    if (s->lock_initialized) {
+        ff_mutex_lock(&s->receiver_lock);
+        OMTReceiver *receiver = s->receivers;
+        while (receiver) {
+            OMTReceiver *next = receiver->next;
+            ffurl_closep(&receiver->tcp);
+            av_free(receiver);
+            receiver = next;
+        }
+        s->receivers = NULL;
+        s->receiver_count = 0;
+        ff_mutex_unlock(&s->receiver_lock);
+        ff_mutex_destroy(&s->receiver_lock);
+        s->lock_initialized = 0;
+    }
     ffurl_closep(&s->listener);
 }
 

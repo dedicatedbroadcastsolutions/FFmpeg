@@ -3889,6 +3889,7 @@ videotoolbox_encoder_deps="videotoolbox VTCompressionSessionPrepareToEncodeFrame
 
 # demuxers / muxers
 omt_demuxer_select="network"
+omt_muxer_deps="threads"
 omt_muxer_select="network"
 ac3_demuxer_select="ac3_parser"
 act_demuxer_select="riffdec"
