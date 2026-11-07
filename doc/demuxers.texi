@@ -1067,10 +1067,12 @@ Select the separate OMT media connection to receive, either @code{video}
 (default) or @code{audio}.
 @end table
 
-The initial implementation supports raw UYVY, YUY2, BGRA, NV12, YV12, and
-P216 video, 8-bit progressive VMX1 video through the @code{vmix} decoder, and
-FPA1 planar floating-point audio. It does not support output/muxing, discovery,
-interlaced/preview video, alpha-bearing OMT frames, or high-bit-depth VMX1.
+The demuxer and muxer support raw UYVY, YUY2, BGRA, NV12, YV12, and P216 video,
+8-bit progressive VMX1 video through the @code{vmix} decoder, and FPA1 planar
+floating-point audio. The muxer currently accepts a single receiver session.
+Neither component implements discovery or multiple-receiver fan-out. Interlaced
+and preview video, OMT alpha formats other than BGRA, and high-bit-depth VMX1
+are not supported yet.
 
 @section rawvideo
 

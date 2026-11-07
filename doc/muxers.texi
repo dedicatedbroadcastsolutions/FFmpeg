@@ -3360,6 +3360,25 @@ ffmpeg -i file.mpg -c copy \
      out.ts
 @end example
 
+@section omt
+
+Open Media Transport (OMT) TCP muxer.
+
+This muxer listens on the specified TCP port. Receivers connect directly using
+the corresponding @code{omt://@var{host}:@var{port}} input URL. Audio and video
+use separate receiver connections to the same port.
+
+The muxer supports raw UYVY, YUY2, BGRA, NV12, YV12, and P216 video, 8-bit VMX1
+packets, and PCM_F32LE audio (sent as OMT FPA1). It currently serves one
+receiver session, does not implement OMT discovery or multi-receiver fan-out,
+and does not encode VMX1.
+
+@table @option
+@item listen_timeout
+Maximum time in milliseconds to wait for each receiver connection. Default is
+30000.
+@end table
+
 @section mxf, mxf_d10, mxf_opatom
 
 MXF muxer.

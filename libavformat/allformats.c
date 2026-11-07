@@ -31,6 +31,7 @@
 
 /* (de)muxers */
 extern const FFInputFormat  ff_omt_demuxer;
+extern const FFOutputFormat ff_omt_muxer;
 extern const FFOutputFormat ff_a64_muxer;
 extern const FFInputFormat  ff_aa_demuxer;
 extern const FFInputFormat  ff_aac_demuxer;

@@ -189,7 +189,8 @@ static int omt_add_video_stream(AVFormatContext *ctx, const uint8_t *header)
         enum AVPixelFormat pix_fmt = omt_pixel_format(codec);
         int expected_size;
 
-        if (flags & (1 | 2 | 4 | 8) ||
+        if (flags & (1 | 4 | 8) ||
+            ((flags & 2) && codec != MKTAG('B', 'G', 'R', 'A')) ||
             ((flags & 16) && codec != MKTAG('P', '2', '1', '6'))) {
             av_log(ctx, AV_LOG_ERROR, "Unsupported OMT raw video flags 0x%x\n", flags);
             return AVERROR_PATCHWELCOME;
