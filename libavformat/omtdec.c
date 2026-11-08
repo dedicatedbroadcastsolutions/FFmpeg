@@ -19,7 +19,10 @@
  */
 
 #include <string.h>
+#include <stdlib.h>
 
+#include "libavutil/avstring.h"
+#include "libavutil/bprint.h"
 #include "libavutil/channel_layout.h"
 #include "libavutil/imgutils.h"
 #include "libavutil/common.h"
@@ -39,6 +42,7 @@
 #define OMT_AUDIO_HEADER_SIZE 24
 #define OMT_TIME_BASE 10000000
 #define OMT_MAX_FRAME_SIZE (256 * 1024 * 1024)
+#define OMT_MAX_DISCOVERY_MESSAGE (64 * 1024)
 
 enum OMTChannel {
     OMT_CHANNEL_VIDEO,
@@ -54,6 +58,8 @@ typedef struct OMTContext {
     int width;
     int height;
     int64_t rw_timeout;
+    char *source_name;
+    char *discovery_server;
 } OMTContext;
 
 #define OFFSET(x) offsetof(OMTContext, x)
@@ -66,6 +72,10 @@ static const AVOption omt_options[] = {
     { "rw_timeout", "maximum network read/write wait in microseconds",
       OFFSET(rw_timeout), AV_OPT_TYPE_INT64,
       { .i64 = 0 }, 0, INT64_MAX, D },
+        { "source_name", "full OMT source name to resolve through discovery", OFFSET(source_name),
+            AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, D },
+        { "discovery_server", "OMT discovery server URL", OFFSET(discovery_server),
+            AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, D },
     { NULL }
 };
 
@@ -92,7 +102,7 @@ static int omt_write_all(URLContext *h, const uint8_t *buf, int size)
 static int omt_send_metadata(OMTContext *s, const char *xml)
 {
     uint8_t header[OMT_HEADER_SIZE] = { 1, 1 };
-    int size = strlen(xml);
+    int size = strlen(xml) + 1;
     int ret;
 
     AV_WL32(header + 12, size);
@@ -100,6 +110,171 @@ static int omt_send_metadata(OMTContext *s, const char *xml)
     if (ret < 0)
         return ret;
     return omt_write_all(s->tcp, (const uint8_t *)xml, size);
+}
+
+static void omt_xml_escape(AVBPrint *bp, const char *text)
+{
+    for (const uint8_t *p = (const uint8_t *)text; *p; p++) {
+        switch (*p) {
+        case '&':  av_bprintf(bp, "&amp;");  break;
+        case '<':  av_bprintf(bp, "&lt;");   break;
+        case '>':  av_bprintf(bp, "&gt;");   break;
+        case '"': av_bprintf(bp, "&quot;"); break;
+        case '\'': av_bprintf(bp, "&apos;"); break;
+        default:
+            if (*p < 0x20 && *p != '\t' && *p != '\n' && *p != '\r')
+                av_bprintf(bp, " ");
+            else
+                av_bprint_append_data(bp, (const char *)p, 1);
+        }
+    }
+}
+
+static int omt_xml_element(const char *xml, const char *name,
+                           char *value, size_t value_size)
+{
+    char start_tag[32], end_tag[32];
+    const char *start, *end;
+    size_t length;
+
+    if (av_strlcpy(start_tag, "<", sizeof(start_tag)) >= sizeof(start_tag) ||
+        av_strlcat(start_tag, name, sizeof(start_tag)) >= sizeof(start_tag) ||
+        av_strlcat(start_tag, ">", sizeof(start_tag)) >= sizeof(start_tag) ||
+        av_strlcpy(end_tag, "</", sizeof(end_tag)) >= sizeof(end_tag) ||
+        av_strlcat(end_tag, name, sizeof(end_tag)) >= sizeof(end_tag) ||
+        av_strlcat(end_tag, ">", sizeof(end_tag)) >= sizeof(end_tag))
+        return AVERROR(EINVAL);
+    start = strstr(xml, start_tag);
+    if (!start)
+        return AVERROR_INVALIDDATA;
+    start += strlen(start_tag);
+    end = strstr(start, end_tag);
+    if (!end)
+        return AVERROR_INVALIDDATA;
+    length = end - start;
+    if (length >= value_size)
+        return AVERROR(ENOSPC);
+    memcpy(value, start, length);
+    value[length] = 0;
+    return 0;
+}
+
+static int omt_parse_address(const char *xml, const char *source_name,
+                             char *host, size_t host_size, int *port)
+{
+    AVBPrint expected;
+    char *expected_name = NULL;
+    char name[256], port_text[16];
+    char *end;
+    long parsed_port;
+    int ret;
+
+    if ((ret = omt_xml_element(xml, "Name", name, sizeof(name))) < 0 ||
+        (ret = omt_xml_element(xml, "Port", port_text, sizeof(port_text))) < 0)
+        return ret;
+    av_bprint_init(&expected, 64, sizeof(name) - 1);
+    omt_xml_escape(&expected, source_name);
+    if (!av_bprint_is_complete(&expected)) {
+        av_bprint_finalize(&expected, NULL);
+        return AVERROR(ENOSPC);
+    }
+    if ((ret = av_bprint_finalize(&expected, &expected_name)) < 0)
+        return ret;
+    if (strcmp(name, expected_name)) {
+        av_free(expected_name);
+        return AVERROR(EAGAIN);
+    }
+    av_free(expected_name);
+
+    parsed_port = strtol(port_text, &end, 10);
+    if (end == port_text || *end || parsed_port < 1 || parsed_port > 65535)
+        return AVERROR_INVALIDDATA;
+    ret = omt_xml_element(xml, "IPAddress", host, host_size);
+    if (ret < 0)
+        ret = omt_xml_element(xml, "Address", host, host_size);
+    if (ret < 0 || !host[0] || !strcmp(host, "0.0.0.0") || !strcmp(host, "::"))
+        return AVERROR_INVALIDDATA;
+    *port = parsed_port;
+    return 0;
+}
+
+static int omt_resolve_source(AVFormatContext *ctx, OMTContext *s,
+                              const char *server_url, char *source_host,
+                              size_t source_host_size, int *source_port)
+{
+    static const char subscribe[] = "<OMTSubscribe Metadata=\"true\" />";
+    char protocol[16], hostname[256], path[1024], authorization[256];
+    char tcp_url[1024], *xml = NULL;
+    URLContext *tcp = NULL;
+    AVDictionary *options = NULL;
+    uint8_t header[OMT_HEADER_SIZE] = { 1, 1 };
+    int port = -1, ret;
+
+    av_url_split(protocol, sizeof(protocol), authorization, sizeof(authorization),
+                 hostname, sizeof(hostname), &port, path, sizeof(path), server_url);
+    if (strcmp(protocol, "omt") || !hostname[0] || port < 1 || port > 65535)
+        return AVERROR(EINVAL);
+    ret = ff_url_join(tcp_url, sizeof(tcp_url), "tcp", NULL, hostname, port, NULL);
+    if (ret < 0 || ret >= sizeof(tcp_url))
+        return AVERROR(EINVAL);
+    ret = av_dict_set_int(&options, "rw_timeout",
+                          s->rw_timeout ? s->rw_timeout : 5 * AV_TIME_BASE, 0);
+    if (ret < 0)
+        goto end;
+    ret = ffurl_open_whitelist(&tcp, tcp_url, AVIO_FLAG_READ_WRITE,
+                               &ctx->interrupt_callback, &options,
+                               ctx->protocol_whitelist, ctx->protocol_blacklist, NULL);
+    if (ret < 0)
+        goto end;
+
+    AV_WL32(header + 12, sizeof(subscribe));
+    ret = omt_write_all(tcp, header, sizeof(header));
+    if (ret >= 0)
+        ret = omt_write_all(tcp, (const uint8_t *)subscribe, sizeof(subscribe));
+    if (ret < 0)
+        goto end;
+
+    xml = av_malloc(OMT_MAX_DISCOVERY_MESSAGE + 1);
+    if (!xml) {
+        ret = AVERROR(ENOMEM);
+        goto end;
+    }
+    for (;;) {
+        ret = ffurl_read_complete(tcp, header, sizeof(header));
+        if (ret < 0)
+            goto end;
+        if (ret != sizeof(header) || header[0] != 1 || header[1] != 1) {
+            ret = AVERROR_INVALIDDATA;
+            goto end;
+        }
+        uint32_t size = AV_RL32(header + 12);
+        if (!size || size > OMT_MAX_DISCOVERY_MESSAGE) {
+            ret = AVERROR_INVALIDDATA;
+            goto end;
+        }
+        ret = ffurl_read_complete(tcp, (uint8_t *)xml, size);
+        if (ret < 0 || ret != size) {
+            ret = ret < 0 ? ret : AVERROR_EOF;
+            goto end;
+        }
+        if (xml[size - 1] == 0)
+            size--;
+        xml[size] = 0;
+        ret = omt_parse_address(xml, s->source_name, source_host,
+                                source_host_size, source_port);
+        if (ret == AVERROR(EAGAIN))
+            continue;
+        if (ret < 0)
+            goto end;
+        break;
+    }
+    ret = 0;
+
+end:
+    av_free(xml);
+    av_dict_free(&options);
+    ffurl_closep(&tcp);
+    return ret;
 }
 
 static int omt_open(AVFormatContext *ctx)
@@ -110,11 +285,25 @@ static int omt_open(AVFormatContext *ctx)
     AVDictionary *options = NULL;
     int port = -1, ret;
 
-    av_url_split(protocol, sizeof(protocol), authorization, sizeof(authorization),
-                 hostname, sizeof(hostname), &port, path, sizeof(path), ctx->url);
-    if (strcmp(protocol, "omt") || !hostname[0] || port < 1 || port > 65535) {
-        av_log(ctx, AV_LOG_ERROR, "Expected an OMT URL of the form omt://host:port\n");
-        return AVERROR(EINVAL);
+    if (s->source_name) {
+        const char *server_url = s->discovery_server ? s->discovery_server : ctx->url;
+        ret = omt_resolve_source(ctx, s, server_url, hostname, sizeof(hostname), &port);
+        if (ret < 0) {
+            av_log(ctx, AV_LOG_ERROR, "Could not resolve OMT source '%s': %s\n",
+                   s->source_name, av_err2str(ret));
+            return ret;
+        }
+    } else {
+        if (s->discovery_server) {
+            av_log(ctx, AV_LOG_ERROR, "source_name is required with discovery_server\n");
+            return AVERROR(EINVAL);
+        }
+        av_url_split(protocol, sizeof(protocol), authorization, sizeof(authorization),
+                     hostname, sizeof(hostname), &port, path, sizeof(path), ctx->url);
+        if (strcmp(protocol, "omt") || !hostname[0] || port < 1 || port > 65535) {
+            av_log(ctx, AV_LOG_ERROR, "Expected an OMT URL of the form omt://host:port\n");
+            return AVERROR(EINVAL);
+        }
     }
     ret = ff_url_join(tcp_url, sizeof(tcp_url), "tcp", NULL, hostname, port, NULL);
     if (ret < 0 || ret >= sizeof(tcp_url))

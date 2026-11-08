@@ -66,6 +66,12 @@ typedef struct OMTDiscoveryTestServer {
     int disconnected;
 } OMTDiscoveryTestServer;
 
+typedef struct OMTDiscoveryResolverTestServer {
+    URLContext *listener;
+    int media_port;
+    int result;
+} OMTDiscoveryResolverTestServer;
+
 static int write_all(URLContext *url, const uint8_t *data, int size)
 {
     int written = 0;
@@ -381,6 +387,142 @@ end:
     return ret;
 }
 
+static void *omt_discovery_resolver_test_server(void *arg)
+{
+    static const char subscribe[] = "<OMTSubscribe Metadata=\"true\" />";
+    OMTDiscoveryResolverTestServer *server = arg;
+    URLContext *client = NULL;
+    uint8_t header[16];
+    char xml[256];
+    int ret;
+
+    ret = ffurl_accept(server->listener, &client);
+    if (ret < 0)
+        goto end;
+    ret = ffurl_read_complete(client, header, sizeof(header));
+    if (ret < 0 || ret != sizeof(header) || header[0] != 1 || header[1] != 1 ||
+        AV_RL16(header + 10) || AV_RL32(header + 12) != sizeof(subscribe)) {
+        ret = ret < 0 ? ret : AVERROR_INVALIDDATA;
+        goto end;
+    }
+    char message[sizeof(subscribe)];
+    ret = ffurl_read_complete(client, (uint8_t *)message, sizeof(message));
+    if (ret < 0 || ret != sizeof(message) || memcmp(message, subscribe, sizeof(subscribe))) {
+        ret = ret < 0 ? ret : AVERROR_INVALIDDATA;
+        goto end;
+    }
+    snprintf(xml, sizeof(xml),
+             "<OMTAddress><Name>Test Host (Camera &amp; One)</Name><Port>%d</Port>"
+             "<Addresses><IPAddress>127.0.0.1</IPAddress></Addresses></OMTAddress>",
+             server->media_port);
+    memset(header, 0, sizeof(header));
+    header[0] = 1;
+    header[1] = 1;
+    AV_WL32(header + 12, strlen(xml) + 1);
+    ret = write_all(client, header, sizeof(header));
+    if (ret >= 0)
+        ret = write_all(client, (const uint8_t *)xml, strlen(xml) + 1);
+
+end:
+    ffurl_closep(&client);
+    server->result = ret;
+    return NULL;
+}
+
+static int omt_test_discovery_resolve(void)
+{
+    static const uint8_t wire_data[] = { 128, 16, 128, 64, 129, 32, 129, 80 };
+    OMTTestCase test = {
+        MKTAG('U', 'Y', 'V', 'Y'), 0, AV_PIX_FMT_UYVY422,
+        wire_data, sizeof(wire_data), wire_data, sizeof(wire_data),
+    };
+    OMTTestServer media_server = { .test = &test };
+    OMTDiscoveryResolverTestServer registry_server = { 0 };
+    AVFormatContext *format = NULL;
+    AVPacket *packet = NULL;
+    AVDictionary *options = NULL;
+    pthread_t media_thread, registry_thread;
+    int media_thread_started = 0, registry_thread_started = 0;
+    int registry_port = -1, media_port = -1, ret = AVERROR(EADDRINUSE);
+    char listener_url[128], registry_url[128];
+
+    for (int i = 0; i < 128; i++) {
+        media_port = 49152 + (av_get_random_seed() + i * 6151) % (65536 - 49152);
+        snprintf(listener_url, sizeof(listener_url),
+                 "tcp://127.0.0.1:%d?listen=2&listen_timeout=5000&timeout=5000000",
+                 media_port);
+        ret = ffurl_open_whitelist(&media_server.listener, listener_url,
+                                   AVIO_FLAG_READ_WRITE, NULL, NULL, NULL, NULL, NULL);
+        if (ret >= 0)
+            break;
+    }
+    if (ret < 0)
+        goto end;
+    registry_server.media_port = media_port;
+    for (int i = 0; i < 128; i++) {
+        registry_port = 49152 + (av_get_random_seed() + i * 4421) % (65536 - 49152);
+        if (registry_port == media_port)
+            continue;
+        snprintf(listener_url, sizeof(listener_url),
+                 "tcp://127.0.0.1:%d?listen=2&listen_timeout=5000&timeout=5000000",
+                 registry_port);
+        ret = ffurl_open_whitelist(&registry_server.listener, listener_url,
+                                   AVIO_FLAG_READ_WRITE, NULL, NULL, NULL, NULL, NULL);
+        if (ret >= 0)
+            break;
+    }
+    if (ret < 0)
+        goto end;
+    ret = pthread_create(&media_thread, NULL, omt_test_server, &media_server);
+    if (ret) {
+        ret = AVERROR(ret);
+        goto end;
+    }
+    media_thread_started = 1;
+    ret = pthread_create(&registry_thread, NULL, omt_discovery_resolver_test_server,
+                         &registry_server);
+    if (ret) {
+        ret = AVERROR(ret);
+        goto end;
+    }
+    registry_thread_started = 1;
+    snprintf(registry_url, sizeof(registry_url), "omt://127.0.0.1:%d", registry_port);
+    ret = av_dict_set(&options, "source_name", "Test Host (Camera & One)", 0);
+    if (ret >= 0)
+        ret = av_dict_set_int(&options, "rw_timeout", 2000000, 0);
+    if (ret < 0)
+        goto end;
+    ret = avformat_open_input(&format, registry_url, av_find_input_format("omt"), &options);
+    if (ret < 0)
+        goto end;
+    packet = av_packet_alloc();
+    if (!packet) {
+        ret = AVERROR(ENOMEM);
+        goto end;
+    }
+    ret = av_read_frame(format, packet);
+    if (ret < 0)
+        goto end;
+    if (packet->size != sizeof(wire_data) || memcmp(packet->data, wire_data, sizeof(wire_data)))
+        ret = AVERROR_INVALIDDATA;
+
+end:
+    av_dict_free(&options);
+    av_packet_free(&packet);
+    avformat_close_input(&format);
+    ffurl_closep(&registry_server.listener);
+    ffurl_closep(&media_server.listener);
+    if (registry_thread_started)
+        pthread_join(registry_thread, NULL);
+    if (media_thread_started)
+        pthread_join(media_thread, NULL);
+    if (ret >= 0 && (registry_server.result < 0 || media_server.result < 0))
+        ret = registry_server.result < 0 ? registry_server.result : media_server.result;
+    if (ret < 0)
+        av_log(NULL, AV_LOG_ERROR, "OMT discovery resolve test failed: %s\n", av_err2str(ret));
+    return ret;
+}
+
 static int omt_test_one(const OMTTestCase *test)
 {
     OMTTestServer server = { .test = test };
@@ -642,10 +784,10 @@ static int omt_test_mux_one(const OMTTestCase *test)
     memset(header, 0, sizeof(header));
     header[0] = 1;
     header[1] = 1;
-    AV_WL32(header + 12, sizeof(subscribe) - 1);
+    AV_WL32(header + 12, sizeof(subscribe));
     ret = write_all(client, header, sizeof(header));
     if (ret >= 0)
-        ret = write_all(client, (const uint8_t *)subscribe, sizeof(subscribe) - 1);
+        ret = write_all(client, (const uint8_t *)subscribe, sizeof(subscribe));
     if (ret < 0)
         goto end;
     av_usleep(100000);
@@ -1143,6 +1285,8 @@ int main(void)
         ret = omt_test_read_timeout();
     if (ret >= 0)
         ret = omt_test_discovery_register();
+    if (ret >= 0)
+        ret = omt_test_discovery_resolve();
     vmix_p216_size = av_base64_decode(vmix_p216_packet, vmix_p216_packet_base64,
                                       sizeof(vmix_p216_packet));
     if (ret >= 0 && vmix_p216_size != 689)

@@ -421,6 +421,8 @@ static int omt_read_subscription(URLContext *client, int *channel)
             return ret;
         if (ret != data_size)
             return AVERROR_EOF;
+        if (xml[data_size - 1] == 0)
+            data_size--;
         xml[data_size] = 0;
         if (!strcmp(xml, video_sub)) {
             *channel = OMT_CHANNEL_VIDEO;
