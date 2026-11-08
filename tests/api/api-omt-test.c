@@ -576,6 +576,183 @@ end:
     return ret;
 }
 
+typedef struct OMTDrainContext {
+    URLContext *client;
+    int expected_frames;
+    int received_frames;
+    int result;
+} OMTDrainContext;
+
+static void *omt_drain_receiver(void *arg)
+{
+    OMTDrainContext *drain = arg;
+    uint8_t header[16], buffer[65536];
+    int ret = 0;
+
+    while (drain->received_frames < drain->expected_frames) {
+        uint32_t size;
+
+        ret = ffurl_read_complete(drain->client, header, sizeof(header));
+        if (ret < 0 || ret != sizeof(header)) {
+            ret = ret < 0 ? ret : AVERROR_EOF;
+            break;
+        }
+        if (header[0] != 1 || header[1] != 2) {
+            ret = AVERROR_INVALIDDATA;
+            break;
+        }
+        size = AV_RL32(header + 12);
+        while (size) {
+            int chunk = FFMIN(size, sizeof(buffer));
+            ret = ffurl_read_complete(drain->client, buffer, chunk);
+            if (ret < 0 || ret != chunk) {
+                ret = ret < 0 ? ret : AVERROR_EOF;
+                break;
+            }
+            size -= chunk;
+        }
+        if (ret < 0)
+            break;
+        drain->received_frames++;
+    }
+    drain->result = ret;
+    return NULL;
+}
+
+static int omt_test_slow_receiver_isolation(void)
+{
+    enum { WIDTH = 512, HEIGHT = 512, FRAME_COUNT = 24 };
+    AVFormatContext *format = NULL;
+    AVPacket *packet = NULL;
+    URLContext *slow = NULL, *fast = NULL;
+    AVDictionary *options = NULL;
+    OMTDrainContext drain = { .expected_frames = FRAME_COUNT };
+    AVStream *stream;
+    char output_url[128], tcp_url[128];
+    static const char subscribe[] = "<OMTSubscribe Video=\"true\" />";
+    uint8_t metadata[16] = { 1, 1 };
+    int port = -1, ret = AVERROR(EADDRINUSE), header_written = 0;
+    int64_t start_time, elapsed = 0;
+    pthread_t drain_thread;
+    int drain_thread_started = 0;
+
+    for (int i = 0; i < 128; i++) {
+        port = 49152 + (av_get_random_seed() + i * 4421) % (65536 - 49152);
+        snprintf(output_url, sizeof(output_url), "omt://127.0.0.1:%d", port);
+        ret = avformat_alloc_output_context2(&format,
+                                             av_guess_format("omt", NULL, NULL),
+                                             NULL, output_url);
+        if (ret < 0)
+            return ret;
+        stream = avformat_new_stream(format, NULL);
+        if (!stream) {
+            ret = AVERROR(ENOMEM);
+            goto end;
+        }
+        stream->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
+        stream->codecpar->codec_id = AV_CODEC_ID_RAWVIDEO;
+        stream->codecpar->format = AV_PIX_FMT_UYVY422;
+        stream->codecpar->width = WIDTH;
+        stream->codecpar->height = HEIGHT;
+        stream->time_base = (AVRational){ 1, 30 };
+        stream->r_frame_rate = stream->avg_frame_rate = (AVRational){ 30, 1 };
+        stream->sample_aspect_ratio = (AVRational){ 1, 1 };
+        ret = avformat_write_header(format, NULL);
+        if (ret >= 0) {
+            header_written = 1;
+            break;
+        }
+        avformat_free_context(format);
+        format = NULL;
+        if (ret != AVERROR(EADDRINUSE))
+            return ret;
+    }
+    if (!header_written)
+        goto end;
+
+    snprintf(tcp_url, sizeof(tcp_url), "tcp://127.0.0.1:%d", port);
+    ret = av_dict_set_int(&options, "rw_timeout", 2000000, 0);
+    if (ret < 0)
+        goto end;
+    ret = ffurl_open_whitelist(&slow, tcp_url, AVIO_FLAG_READ_WRITE, NULL,
+                               &options, NULL, NULL, NULL);
+    av_dict_free(&options);
+    if (ret < 0)
+        goto end;
+    ret = av_dict_set_int(&options, "rw_timeout", 2000000, 0);
+    if (ret < 0)
+        goto end;
+    ret = ffurl_open_whitelist(&fast, tcp_url, AVIO_FLAG_READ_WRITE, NULL,
+                               &options, NULL, NULL, NULL);
+    av_dict_free(&options);
+    if (ret < 0)
+        goto end;
+
+    AV_WL32(metadata + 12, sizeof(subscribe) - 1);
+    ret = write_all(slow, metadata, sizeof(metadata));
+    if (ret >= 0)
+        ret = write_all(slow, (const uint8_t *)subscribe, sizeof(subscribe) - 1);
+    if (ret >= 0)
+        ret = write_all(fast, metadata, sizeof(metadata));
+    if (ret >= 0)
+        ret = write_all(fast, (const uint8_t *)subscribe, sizeof(subscribe) - 1);
+    if (ret < 0)
+        goto end;
+    av_usleep(100000);
+
+    drain.client = fast;
+    ret = pthread_create(&drain_thread, NULL, omt_drain_receiver, &drain);
+    if (ret) {
+        ret = AVERROR(ret);
+        goto end;
+    }
+    drain_thread_started = 1;
+
+    packet = av_packet_alloc();
+    if (!packet) {
+        ret = AVERROR(ENOMEM);
+        goto end;
+    }
+    ret = av_new_packet(packet, WIDTH * HEIGHT * 2);
+    if (ret < 0)
+        goto end;
+    memset(packet->data, 0x80, packet->size);
+    start_time = av_gettime_relative();
+    for (int i = 0; i < FRAME_COUNT; i++) {
+        packet->pts = packet->dts = i;
+        packet->duration = 1;
+        if ((ret = av_write_frame(format, packet)) < 0)
+            goto end;
+        av_usleep(5000);
+    }
+    elapsed = av_gettime_relative() - start_time;
+    ret = av_write_trailer(format);
+    header_written = 0;
+    if (ret < 0)
+        goto end;
+    ret = 0;
+
+end:
+    av_dict_free(&options);
+    av_packet_free(&packet);
+    ffurl_closep(&slow);
+    ffurl_closep(&fast);
+    if (format) {
+        if (header_written)
+            av_write_trailer(format);
+        avformat_free_context(format);
+    }
+    if (drain_thread_started)
+        pthread_join(drain_thread, NULL);
+    if (ret >= 0 && (drain.received_frames < FRAME_COUNT - 2 || elapsed > 2000000))
+        ret = AVERROR_INVALIDDATA;
+    if (ret < 0)
+        av_log(NULL, AV_LOG_ERROR,
+               "OMT slow-receiver test failed: frames=%d elapsed=%"PRId64" us\n",
+               drain.received_frames, elapsed);
+    return ret;
+}
+
 int main(void)
 {
     static const char vmix_p216_packet_base64[] =
@@ -686,6 +863,8 @@ int main(void)
                                  audio_planar, sizeof(audio_planar));
     if (ret < 0)
         av_log(NULL, AV_LOG_ERROR, "OMT API audio test failed: %s\n", av_err2str(ret));
+    if (ret >= 0)
+        ret = omt_test_slow_receiver_isolation();
     vmix_p216_size = av_base64_decode(vmix_p216_packet, vmix_p216_packet_base64,
                                       sizeof(vmix_p216_packet));
     if (ret >= 0 && vmix_p216_size != 689)
