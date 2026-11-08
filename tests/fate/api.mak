@@ -12,6 +12,11 @@ fate-api-vmix: $(APITESTSDIR)/api-vmix-test$(EXESUF)
 fate-api-vmix: CMD = run $(APITESTSDIR)/api-vmix-test$(EXESUF)
 fate-api-vmix: CMP = null
 
+FATE_API_LIBAVFORMAT-$(call ALLYES, OMT_DEMUXER OMT_MUXER TCP_PROTOCOL) += fate-api-omt
+fate-api-omt: $(APITESTSDIR)/api-omt-test$(EXESUF)
+fate-api-omt: CMD = run $(APITESTSDIR)/api-omt-test$(EXESUF)
+fate-api-omt: CMP = null
+
 FATE_API_LIBAVCODEC-$(CONFIG_MOVTEXT_ENCODER) += fate-api-movtext
 fate-api-movtext: $(APITESTSDIR)/api-movtext-test$(EXESUF)
 fate-api-movtext: CMD = run $(APITESTSDIR)/api-movtext-test$(EXESUF)
