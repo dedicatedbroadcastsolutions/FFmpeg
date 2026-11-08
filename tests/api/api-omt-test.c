@@ -93,6 +93,32 @@ static int write_all(URLContext *url, const uint8_t *data, int size)
     return 0;
 }
 
+static int read_omt_metadata(URLContext *client, const char *expected)
+{
+    uint8_t header[16], data[512];
+    uint32_t size;
+    int ret;
+
+    ret = ffurl_read_complete(client, header, sizeof(header));
+    if (ret < 0 || ret != sizeof(header))
+        return ret < 0 ? ret : AVERROR_EOF;
+    size = AV_RL32(header + 12);
+    if (size > sizeof(data))
+        return AVERROR_INVALIDDATA;
+    ret = ffurl_read_complete(client, data, size);
+    if (ret < 0 || ret != size)
+        return ret < 0 ? ret : AVERROR_EOF;
+    if (header[0] != 1 || header[1] != 1 || AV_RL16(header + 10) ||
+        size != strlen(expected) + 1 || data[size - 1] ||
+        strcmp((const char *)data, expected)) {
+        av_log(NULL, AV_LOG_ERROR,
+               "OMT metadata mismatch: v=%u type=%u header-metadata=%u size=%u payload=%s\n",
+               header[0], header[1], AV_RL16(header + 10), size, data);
+        return AVERROR_INVALIDDATA;
+    }
+    return 0;
+}
+
 static int set_omt_packet_metadata(AVPacket *packet, const char *xml)
 {
     AVDictionary *metadata = NULL;
@@ -930,6 +956,25 @@ static int omt_test_mux_one(const OMTTestCase *test)
             goto end;
         }
     }
+    stage = "read initial OMT tally";
+    ret = read_omt_metadata(client, "<OMTTally Preview=\"false\" Program==\"false\" />");
+    if (ret < 0)
+        goto end;
+    static const char tally_preview[] =
+        "<OMTTally Preview=\"true\" Program==\"false\" />";
+    memset(header, 0, sizeof(header));
+    header[0] = 1;
+    header[1] = 1;
+    AV_WL32(header + 12, sizeof(tally_preview));
+    ret = write_all(client, header, sizeof(header));
+    if (ret >= 0)
+        ret = write_all(client, (const uint8_t *)tally_preview, sizeof(tally_preview));
+    if (ret < 0)
+        goto end;
+    stage = "read aggregated preview tally";
+    ret = read_omt_metadata(client, tally_preview);
+    if (ret < 0)
+        goto end;
 
     packet = av_packet_alloc();
     stage = "allocate test packet";
@@ -1088,6 +1133,10 @@ static int omt_test_audio_mux(const uint8_t *interleaved, int interleaved_size,
         goto end;
     av_usleep(100000);
 
+    ret = read_omt_metadata(client, "<OMTTally Preview=\"false\" Program==\"false\" />");
+    if (ret < 0)
+        goto end;
+
     packet = av_packet_alloc();
     if (!packet) {
         ret = AVERROR(ENOMEM);
@@ -1164,7 +1213,7 @@ static void *omt_drain_receiver(void *arg)
             ret = ret < 0 ? ret : AVERROR_EOF;
             break;
         }
-        if (header[0] != 1 || header[1] != 2) {
+        if (header[0] != 1 || (header[1] != 1 && header[1] != 2)) {
             ret = AVERROR_INVALIDDATA;
             break;
         }
@@ -1180,6 +1229,8 @@ static void *omt_drain_receiver(void *arg)
         }
         if (ret < 0)
             break;
+        if (header[1] == 1)
+            continue;
         drain->received_frames++;
     }
     drain->result = ret;

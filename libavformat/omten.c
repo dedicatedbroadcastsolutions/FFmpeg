@@ -81,15 +81,24 @@ typedef struct OMTMuxContext {
     atomic_int discovery_exiting;
     int discovery_thread_started;
     int listener_port;
+    int tally_preview;
+    int tally_program;
     int stream_index[OMT_CHANNEL_COUNT];
 } OMTMuxContext;
 
 typedef struct OMTReceiver {
+    AVFormatContext *ctx;
     URLContext *tcp;
     AVThreadMessageQueue *queue;
     pthread_t thread;
+    pthread_t control_thread;
+    OMTMuxContext *mux;
     int channel;
     int thread_started;
+    int control_thread_started;
+    atomic_int control_exiting;
+    int tally_preview;
+    int tally_program;
     atomic_int failed;
     atomic_int finished;
     atomic_int error;
@@ -299,7 +308,7 @@ static int omt_make_frame_packet(AVPacket **pkt, int type, int64_t pts,
                                  const uint8_t *metadata, int metadata_size)
 {
     uint64_t frame_size = (uint64_t)extended_size + data_size + metadata_size;
-    int ret;
+    int ret = 0;
 
     if (metadata_size < 0 || metadata_size > UINT16_MAX ||
         (metadata_size && !metadata) || frame_size > OMT_MAX_FRAME_SIZE ||
@@ -365,6 +374,14 @@ static void *omt_receiver_thread(void *arg)
 
 static void omt_receiver_stop(OMTReceiver *receiver)
 {
+    if (receiver->control_thread_started) {
+        int fd = ffurl_get_file_handle(receiver->tcp);
+        atomic_store(&receiver->control_exiting, 1);
+        if (fd >= 0)
+            shutdown(fd, SHUT_RD);
+        pthread_join(receiver->control_thread, NULL);
+        receiver->control_thread_started = 0;
+    }
     if (receiver->queue) {
         av_thread_message_queue_set_err_send(receiver->queue, AVERROR_EOF);
         av_thread_message_flush(receiver->queue);
@@ -440,6 +457,145 @@ static int omt_queue_frame(AVFormatContext *ctx, OMTMuxContext *s, int channel,
     ff_mutex_unlock(&s->receiver_lock);
     av_packet_free(&pkt);
     return ret;
+}
+
+static const char *omt_tally_xml(int preview, int program)
+{
+    if (preview && program)
+        return "<OMTTally Preview=\"true\" Program==\"true\" />";
+    if (preview)
+        return "<OMTTally Preview=\"true\" Program==\"false\" />";
+    if (program)
+        return "<OMTTally Preview=\"false\" Program==\"true\" />";
+    return "<OMTTally Preview=\"false\" Program==\"false\" />";
+}
+
+static int omt_broadcast_tally(OMTMuxContext *s, int preview, int program)
+{
+    const char *xml = omt_tally_xml(preview, program);
+    AVPacket *pkt = NULL;
+    int ret;
+
+    ret = omt_make_frame_packet(&pkt, 1, 0, NULL, 0,
+                                (const uint8_t *)xml, strlen(xml) + 1, NULL, 0);
+    if (ret < 0)
+        return ret;
+    ff_mutex_lock(&s->receiver_lock);
+    for (OMTReceiver *receiver = s->receivers; receiver; receiver = receiver->next) {
+        AVPacket *queued_pkt;
+
+        if (receiver->channel != OMT_CHANNEL_VIDEO || atomic_load(&receiver->failed) ||
+            atomic_load(&receiver->finished))
+            continue;
+        queued_pkt = av_packet_clone(pkt);
+        if (!queued_pkt) {
+            omt_receiver_fail(receiver, AVERROR(ENOMEM));
+            continue;
+        }
+        ret = av_thread_message_queue_send(receiver->queue, &queued_pkt,
+                                           AV_THREAD_MESSAGE_NONBLOCK);
+        if (ret < 0) {
+            av_packet_free(&queued_pkt);
+            omt_receiver_fail(receiver, ret);
+        }
+    }
+    ff_mutex_unlock(&s->receiver_lock);
+    av_packet_free(&pkt);
+    return 0;
+}
+
+static int omt_queue_receiver_metadata(OMTReceiver *receiver, const char *xml)
+{
+    AVPacket *pkt = NULL;
+    int ret = omt_make_frame_packet(&pkt, 1, 0, NULL, 0,
+                                    (const uint8_t *)xml, strlen(xml) + 1, NULL, 0);
+
+    if (ret < 0)
+        return ret;
+    ret = av_thread_message_queue_send(receiver->queue, &pkt, 0);
+    if (ret < 0)
+        av_packet_free(&pkt);
+    return ret;
+}
+
+static int omt_update_tally(AVFormatContext *ctx, OMTReceiver *source,
+                            int source_preview, int source_program)
+{
+    OMTMuxContext *s = source->mux;
+    int preview = 0, program = 0, changed;
+
+    ff_mutex_lock(&s->receiver_lock);
+    source->tally_preview = source_preview;
+    source->tally_program = source_program;
+    for (OMTReceiver *receiver = s->receivers; receiver; receiver = receiver->next) {
+        if (receiver->channel != OMT_CHANNEL_VIDEO || atomic_load(&receiver->failed))
+            continue;
+        preview |= receiver->tally_preview;
+        program |= receiver->tally_program;
+    }
+    changed = preview != s->tally_preview || program != s->tally_program;
+    s->tally_preview = preview;
+    s->tally_program = program;
+    ff_mutex_unlock(&s->receiver_lock);
+
+    if (changed)
+        return omt_broadcast_tally(s, preview, program);
+    return 0;
+}
+
+static void *omt_control_thread(void *arg)
+{
+    OMTReceiver *receiver = arg;
+    AVFormatContext *ctx = receiver->ctx;
+    uint8_t header[OMT_HEADER_SIZE];
+    char xml[4097];
+    int ret = 0;
+
+    while (!atomic_load(&receiver->control_exiting) &&
+           !atomic_load(&receiver->failed)) {
+        uint32_t size;
+        int tally_preview = 0, tally_program = 0, is_tally = 1;
+        ret = ffurl_read_complete(receiver->tcp, header, sizeof(header));
+        if (ret == AVERROR(ETIMEDOUT) || ret == AVERROR(EAGAIN))
+            continue;
+        if (ret < 0 || ret != sizeof(header))
+            break;
+        if (header[0] != 1 || header[1] != 1 || AV_RL16(header + 10)) {
+            ret = AVERROR_INVALIDDATA;
+            break;
+        }
+        size = AV_RL32(header + 12);
+        if (!size || size >= sizeof(xml)) {
+            ret = AVERROR_INVALIDDATA;
+            break;
+        }
+        ret = ffurl_read_complete(receiver->tcp, (uint8_t *)xml, size);
+        if (ret < 0 || ret != size) {
+            ret = ret < 0 ? ret : AVERROR_EOF;
+            break;
+        }
+        if (xml[size - 1] == 0)
+            size--;
+        xml[size] = 0;
+        if (!strcmp(xml, "<OMTTally Preview=\"true\" Program==\"true\" />")) {
+            tally_preview = tally_program = 1;
+        } else if (!strcmp(xml, "<OMTTally Preview=\"true\" Program==\"false\" />")) {
+            tally_preview = 1;
+        } else if (!strcmp(xml, "<OMTTally Preview=\"false\" Program==\"true\" />")) {
+            tally_program = 1;
+        } else if (!strcmp(xml, "<OMTTally Preview=\"false\" Program==\"false\" />")) {
+        } else {
+            is_tally = 0;
+        }
+        if (is_tally)
+            omt_update_tally(ctx, receiver, tally_preview, tally_program);
+    }
+    if (!atomic_load(&receiver->control_exiting)) {
+        omt_update_tally(ctx, receiver, 0, 0);
+        if (ret < 0)
+            omt_receiver_fail(receiver, ret);
+    }
+    return NULL;
 }
 
 static int omt_read_subscription(URLContext *client, int *channel)
@@ -567,6 +723,15 @@ static int omt_queue_sender_info(AVFormatContext *ctx, OMTMuxContext *s,
         ret = omt_queue_xml(receiver, s->connection_metadata);
     else
         ret = 0;
+    if (ret >= 0) {
+        int preview, program;
+        ff_mutex_lock(&s->receiver_lock);
+        preview = s->tally_preview;
+        program = s->tally_program;
+        ff_mutex_unlock(&s->receiver_lock);
+        ret = omt_queue_receiver_metadata(receiver,
+                                          omt_tally_xml(preview, program));
+    }
     return ret;
 }
 
@@ -602,6 +767,8 @@ static void *omt_accept_thread(void *arg)
             ffurl_closep(&client);
             continue;
         }
+        receiver->ctx = ctx;
+        receiver->mux = s;
         receiver->tcp = client;
         receiver->channel = channel;
         ret = av_thread_message_queue_alloc(&receiver->queue,
@@ -617,6 +784,7 @@ static void *omt_accept_thread(void *arg)
         atomic_init(&receiver->failed, 0);
         atomic_init(&receiver->finished, 0);
         atomic_init(&receiver->error, 0);
+        atomic_init(&receiver->control_exiting, 0);
         ret = omt_queue_sender_info(ctx, s, receiver);
         if (ret < 0) {
             omt_receiver_stop(receiver);
@@ -638,6 +806,19 @@ static void *omt_accept_thread(void *arg)
         s->receivers = receiver;
         s->receiver_count++;
         ff_mutex_unlock(&s->receiver_lock);
+        if (receiver->channel == OMT_CHANNEL_VIDEO) {
+            ret = pthread_create(&receiver->control_thread, NULL,
+                                 omt_control_thread, receiver);
+            if (ret) {
+                ff_mutex_lock(&s->receiver_lock);
+                s->receivers = receiver->next;
+                s->receiver_count--;
+                ff_mutex_unlock(&s->receiver_lock);
+                omt_receiver_stop(receiver);
+                continue;
+            }
+            receiver->control_thread_started = 1;
+        }
     }
     return NULL;
 }

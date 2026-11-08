@@ -3370,7 +3370,8 @@ use separate receiver connections to the same port.
 
 The muxer supports raw UYVY, YUY2, BGRA, NV12, YV12, and P216 video, VMX1
 packets, and PCM_F32LE audio (sent as OMT FPA1). It supports fan-out to up to
-64 receiver channel connections.
+64 receiver channel connections. Receiver preview/program tally is aggregated
+and relayed to connected video receivers.
 
 @table @option
 @item discovery_server
