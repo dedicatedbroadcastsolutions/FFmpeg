@@ -165,6 +165,7 @@ static enum AVPixelFormat omt_pixel_format(uint32_t codec)
     case MKTAG('U', 'Y', 'V', 'Y'): return AV_PIX_FMT_UYVY422;
     case MKTAG('Y', 'U', 'Y', '2'): return AV_PIX_FMT_YUYV422;
     case MKTAG('B', 'G', 'R', 'A'): return AV_PIX_FMT_BGRA;
+    case MKTAG('B', 'G', 'R', 'X'): return AV_PIX_FMT_BGR0;
     case MKTAG('N', 'V', '1', '2'): return AV_PIX_FMT_NV12;
     case MKTAG('Y', 'V', '1', '2'): return AV_PIX_FMT_YUV420P;
     case MKTAG('P', '2', '1', '6'): return AV_PIX_FMT_P216LE;
@@ -285,8 +286,12 @@ static int omt_add_video_stream(AVFormatContext *ctx, const uint8_t *header)
             return AVERROR(ENOMEM);
         st->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
         st->codecpar->codec_id = AV_CODEC_ID_RAWVIDEO;
-        st->codecpar->codec_tag = codec == MKTAG('U', 'Y', 'V', 'A') ||
-                                  codec == MKTAG('P', 'A', '1', '6') ? 0 : codec;
+        if (codec == MKTAG('B', 'G', 'R', 'X') ||
+            codec == MKTAG('U', 'Y', 'V', 'A') ||
+            codec == MKTAG('P', 'A', '1', '6'))
+            st->codecpar->codec_tag = 0;
+        else
+            st->codecpar->codec_tag = codec;
         st->codecpar->format = pix_fmt;
         if (pix_fmt == AV_PIX_FMT_P216LE || pix_fmt == AV_PIX_FMT_YUVA422P10LE)
             st->codecpar->bits_per_raw_sample = 10;

@@ -1071,7 +1071,7 @@ Set the maximum time to wait for network reads or writes, in microseconds.
 The default value of 0 disables the timeout.
 @end table
 
-The demuxer and muxer support raw UYVY, YUY2, BGRA, UYVA, PA16, NV12, YV12,
+The demuxer and muxer support raw UYVY, YUY2, BGRA, BGRX, UYVA, PA16, NV12, YV12,
 and P216 video, 8-bit progressive VMX1 video through the @code{vmix} decoder,
 and FPA1 planar floating-point audio. The muxer supports up to 64 receiver
 channel connections and queues up to eight frames per receiver. Receivers that

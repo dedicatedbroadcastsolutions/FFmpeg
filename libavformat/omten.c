@@ -438,6 +438,9 @@ static int omt_video_header(AVFormatContext *ctx, AVStream *st,
             codec = MKTAG('B', 'G', 'R', 'A');
             flags |= 2;
             break;
+        case AV_PIX_FMT_BGR0:
+            codec = MKTAG('B', 'G', 'R', 'X');
+            break;
         case AV_PIX_FMT_YUVA422P:
             codec = MKTAG('U', 'Y', 'V', 'A');
             flags |= 2;
