@@ -23,6 +23,8 @@
 
 #include "config_components.h"
 
+#include "libavutil/avstring.h"
+#include "libavutil/bprint.h"
 #include "libavutil/channel_layout.h"
 #include "libavutil/common.h"
 #include "libavutil/intfloat.h"
@@ -37,6 +39,7 @@
 #include "avformat.h"
 #include "internal.h"
 #include "mux.h"
+#include "network.h"
 #include "url.h"
 
 #define OMT_HEADER_SIZE 16
@@ -47,6 +50,7 @@
 #define OMT_MAX_RECEIVERS 64
 #define OMT_MAX_QUEUED_FRAMES 8
 #define OMT_CLIENT_TIMEOUT (5 * AV_TIME_BASE)
+#define OMT_MAX_DISCOVERY_MESSAGE (64 * 1024)
 
 enum OMTChannel {
     OMT_CHANNEL_VIDEO,
@@ -64,6 +68,13 @@ typedef struct OMTMuxContext {
     int receiver_count;
     int lock_initialized;
     int thread_started;
+    char *discovery_server;
+    char *source_name;
+    URLContext *discovery_tcp;
+    pthread_t discovery_thread;
+    atomic_int discovery_exiting;
+    int discovery_thread_started;
+    int listener_port;
     int stream_index[OMT_CHANNEL_COUNT];
 } OMTMuxContext;
 
@@ -79,9 +90,20 @@ typedef struct OMTReceiver {
     struct OMTReceiver *next;
 } OMTReceiver;
 
+#define OFFSET(x) offsetof(OMTMuxContext, x)
+#define E AV_OPT_FLAG_ENCODING_PARAM
+static const AVOption omt_mux_options[] = {
+        { "discovery_server", "OMT discovery server URL", OFFSET(discovery_server),
+            AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, E },
+        { "source_name", "source name advertised to OMT discovery", OFFSET(source_name),
+            AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, E },
+        { NULL }
+};
+
 static const AVClass omt_mux_class = {
     .class_name = "omt muxer",
     .item_name  = av_default_item_name,
+        .option     = omt_mux_options,
     .version    = LIBAVUTIL_VERSION_INT,
 };
 
@@ -96,6 +118,141 @@ static int omt_write_all(URLContext *h, const uint8_t *buf, int size)
         written += ret;
     }
     return 0;
+}
+
+static void omt_xml_escape(AVBPrint *bp, const char *text)
+{
+    for (const uint8_t *p = (const uint8_t *)text; *p; p++) {
+        switch (*p) {
+        case '&':  av_bprintf(bp, "&amp;");  break;
+        case '<':  av_bprintf(bp, "&lt;");   break;
+        case '>':  av_bprintf(bp, "&gt;");   break;
+        case '"': av_bprintf(bp, "&quot;"); break;
+        case '\'': av_bprintf(bp, "&apos;"); break;
+        default:
+            if (*p < 0x20 && *p != '\t' && *p != '\n' && *p != '\r')
+                av_bprintf(bp, " ");
+            else
+                av_bprint_append_data(bp, (const char *)p, 1);
+        }
+    }
+}
+
+static void *omt_discovery_thread(void *arg)
+{
+    OMTMuxContext *s = arg;
+    uint8_t header[OMT_HEADER_SIZE], buffer[1024];
+
+    while (!atomic_load(&s->discovery_exiting)) {
+        int ret = ffurl_read_complete(s->discovery_tcp, header, sizeof(header));
+        if (ret == AVERROR(ETIMEDOUT) || ret == AVERROR(EAGAIN))
+            continue;
+        if (ret < 0 || ret != sizeof(header) || header[0] != 1 || header[1] != 1)
+            break;
+
+        uint32_t size = AV_RL32(header + 12);
+        if (size > OMT_MAX_DISCOVERY_MESSAGE)
+            break;
+        while (size) {
+            int chunk = FFMIN(size, sizeof(buffer));
+            ret = ffurl_read_complete(s->discovery_tcp, buffer, chunk);
+            if (ret < 0 || ret != chunk)
+                return NULL;
+            size -= chunk;
+        }
+    }
+    return NULL;
+}
+
+static int omt_open_discovery(AVFormatContext *ctx, OMTMuxContext *s)
+{
+    static const char subscribe[] = "<OMTSubscribe Metadata=\"true\" />";
+    char protocol[16], hostname[256], path[1024], authorization[256];
+    char tcp_url[1024], machine_name[256];
+    AVBPrint xml;
+    AVDictionary *options = NULL;
+    uint8_t header[OMT_HEADER_SIZE] = { 1, 1 };
+    char *xml_data = NULL;
+    size_t xml_size;
+    int port = -1, ret;
+
+    if (!s->discovery_server)
+        return 0;
+    if (!s->source_name || !s->source_name[0]) {
+        av_log(ctx, AV_LOG_ERROR,
+               "source_name is required when discovery_server is configured\n");
+        return AVERROR(EINVAL);
+    }
+
+    av_url_split(protocol, sizeof(protocol), authorization, sizeof(authorization),
+                 hostname, sizeof(hostname), &port, path, sizeof(path), s->discovery_server);
+    if (strcmp(protocol, "omt") || !hostname[0] || port < 1 || port > 65535) {
+        av_log(ctx, AV_LOG_ERROR,
+               "Expected a discovery_server URL of the form omt://host:port\n");
+        return AVERROR(EINVAL);
+    }
+    ret = ff_url_join(tcp_url, sizeof(tcp_url), "tcp", NULL, hostname, port, NULL);
+    if (ret < 0 || ret >= sizeof(tcp_url))
+        return AVERROR(EINVAL);
+    if ((ret = av_dict_set_int(&options, "rw_timeout", 500000, 0)) < 0)
+        goto end;
+    ret = ffurl_open_whitelist(&s->discovery_tcp, tcp_url, AVIO_FLAG_READ_WRITE,
+                               &ctx->interrupt_callback, &options,
+                               ctx->protocol_whitelist, ctx->protocol_blacklist, NULL);
+    if (ret < 0)
+        goto end;
+
+    AV_WL32(header + 12, sizeof(subscribe));
+    ret = omt_write_all(s->discovery_tcp, header, sizeof(header));
+    if (ret >= 0)
+        ret = omt_write_all(s->discovery_tcp, (const uint8_t *)subscribe, sizeof(subscribe));
+    if (ret < 0)
+        goto end;
+
+    if (gethostname(machine_name, sizeof(machine_name) - 1) < 0)
+        av_strlcpy(machine_name, "localhost", sizeof(machine_name));
+    machine_name[sizeof(machine_name) - 1] = 0;
+    av_bprint_init(&xml, 128, OMT_MAX_DISCOVERY_MESSAGE - 1);
+    av_bprintf(&xml, "<OMTAddress><Name>");
+    omt_xml_escape(&xml, machine_name);
+    av_bprintf(&xml, " (");
+    omt_xml_escape(&xml, s->source_name);
+    av_bprintf(&xml,
+               ")</Name><Port>%d</Port><Addresses><IPAddress>0.0.0.0</IPAddress>"
+               "</Addresses></OMTAddress>", s->listener_port);
+    if (!av_bprint_is_complete(&xml)) {
+        av_bprint_finalize(&xml, NULL);
+        ret = AVERROR(EINVAL);
+        goto end;
+    }
+    if ((ret = av_bprint_finalize(&xml, &xml_data)) < 0)
+        goto end;
+    xml_size = strlen(xml_data) + 1;
+    if (xml_size > UINT32_MAX || xml_size > OMT_MAX_DISCOVERY_MESSAGE) {
+        ret = AVERROR(EINVAL);
+        goto end;
+    }
+    AV_WL32(header + 12, xml_size);
+    ret = omt_write_all(s->discovery_tcp, header, sizeof(header));
+    if (ret >= 0)
+        ret = omt_write_all(s->discovery_tcp, (const uint8_t *)xml_data, xml_size);
+    if (ret < 0)
+        goto end;
+
+    atomic_init(&s->discovery_exiting, 0);
+    ret = pthread_create(&s->discovery_thread, NULL, omt_discovery_thread, s);
+    if (ret) {
+        ret = AVERROR(ret);
+        goto end;
+    }
+    s->discovery_thread_started = 1;
+
+end:
+    av_free(xml_data);
+    av_dict_free(&options);
+    if (ret < 0)
+        ffurl_closep(&s->discovery_tcp);
+    return ret;
 }
 
 static int omt_make_frame_packet(AVPacket **pkt, int type, int64_t pts,
@@ -294,6 +451,7 @@ static int omt_open_listener(AVFormatContext *ctx)
                       "?listen=2&listen_timeout=10&timeout=5000000");
     if (ret < 0 || ret >= sizeof(tcp_url))
         return AVERROR(EINVAL);
+    s->listener_port = port;
     return ffurl_open_whitelist(&s->listener, tcp_url, AVIO_FLAG_READ_WRITE,
                                 &ctx->interrupt_callback, NULL,
                                 ctx->protocol_whitelist, ctx->protocol_blacklist, NULL);
@@ -395,8 +553,18 @@ static int omt_write_header(AVFormatContext *ctx)
 
     if ((ret = omt_open_listener(ctx)) < 0)
         return ret;
+    if ((ret = omt_open_discovery(ctx, s)) < 0) {
+        ffurl_closep(&s->listener);
+        return ret;
+    }
     ret = ff_mutex_init(&s->receiver_lock, NULL);
     if (ret) {
+        if (s->discovery_thread_started) {
+            atomic_store(&s->discovery_exiting, 1);
+            pthread_join(s->discovery_thread, NULL);
+            s->discovery_thread_started = 0;
+        }
+        ffurl_closep(&s->discovery_tcp);
         ffurl_closep(&s->listener);
         return AVERROR(ret);
     }
@@ -636,6 +804,12 @@ static int omt_write_packet(AVFormatContext *ctx, AVPacket *pkt)
 static void omt_close(AVFormatContext *ctx)
 {
     OMTMuxContext *s = ctx->priv_data;
+    if (s->discovery_thread_started) {
+        atomic_store(&s->discovery_exiting, 1);
+        pthread_join(s->discovery_thread, NULL);
+        s->discovery_thread_started = 0;
+    }
+    ffurl_closep(&s->discovery_tcp);
     if (s->thread_started) {
         atomic_store(&s->exiting, 1);
         pthread_join(s->accept_thread, NULL);

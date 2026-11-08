@@ -3368,12 +3368,20 @@ This muxer listens on the specified TCP port. Receivers connect directly using
 the corresponding @code{omt://@var{host}:@var{port}} input URL. Audio and video
 use separate receiver connections to the same port.
 
-The muxer supports raw UYVY, YUY2, BGRA, NV12, YV12, and P216 video, 8-bit VMX1
+The muxer supports raw UYVY, YUY2, BGRA, NV12, YV12, and P216 video, VMX1
 packets, and PCM_F32LE audio (sent as OMT FPA1). It supports fan-out to up to
-64 receiver channel connections. OMT discovery and VMX1 encoding are not
-implemented.
+64 receiver channel connections.
 
 @table @option
+@item discovery_server
+Connect to an OMT discovery server at the specified @code{omt://host:port} URL
+and register this sender for the lifetime of the muxer. Registration requires
+@option{source_name}. The server connection is closed with the muxer, which
+causes the server to remove the source.
+
+@item source_name
+Name to advertise when @option{discovery_server} is set.
+
 @item listen_timeout
 Maximum time in milliseconds to wait for each receiver connection. Default is
 30000.

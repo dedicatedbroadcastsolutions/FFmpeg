@@ -59,6 +59,13 @@ typedef struct OMTTimeoutTestServer {
     int result;
 } OMTTimeoutTestServer;
 
+typedef struct OMTDiscoveryTestServer {
+    URLContext *listener;
+    char xml[512];
+    int result;
+    int disconnected;
+} OMTDiscoveryTestServer;
+
 static int write_all(URLContext *url, const uint8_t *data, int size)
 {
     int written = 0;
@@ -213,6 +220,165 @@ end:
     ffurl_closep(&client);
     server->result = ret;
     return NULL;
+}
+
+static void *omt_discovery_test_server(void *arg)
+{
+    static const char subscribe[] = "<OMTSubscribe Metadata=\"true\" />";
+    OMTDiscoveryTestServer *server = arg;
+    URLContext *client = NULL;
+    uint8_t header[16], message[512], byte;
+    uint32_t size;
+    int ret;
+
+    ret = ffurl_accept(server->listener, &client);
+    if (ret < 0)
+        goto end;
+    for (int i = 0; i < 2; i++) {
+        ret = ffurl_read_complete(client, header, sizeof(header));
+        if (ret < 0 || ret != sizeof(header) || header[0] != 1 || header[1] != 1 ||
+            AV_RL16(header + 10)) {
+            ret = ret < 0 ? ret : AVERROR_INVALIDDATA;
+            goto end;
+        }
+        size = AV_RL32(header + 12);
+        if (size < 2 || size > sizeof(message)) {
+            ret = AVERROR_INVALIDDATA;
+            goto end;
+        }
+        ret = ffurl_read_complete(client, message, size);
+        if (ret < 0 || ret != size) {
+            ret = ret < 0 ? ret : AVERROR_EOF;
+            goto end;
+        }
+        if (message[size - 1]) {
+            ret = AVERROR_INVALIDDATA;
+            goto end;
+        }
+        if (!i) {
+            if (size != sizeof(subscribe) || memcmp(message, subscribe, sizeof(subscribe))) {
+                ret = AVERROR_INVALIDDATA;
+                goto end;
+            }
+        } else {
+            memcpy(server->xml, message, size);
+        }
+    }
+    ret = ffurl_read(client, &byte, 1);
+    server->disconnected = ret <= 0;
+
+end:
+    ffurl_closep(&client);
+    server->result = ret;
+    return NULL;
+}
+
+static int omt_test_discovery_register(void)
+{
+    OMTDiscoveryTestServer server = { 0 };
+    AVFormatContext *format = NULL;
+    AVDictionary *options = NULL;
+    AVStream *stream;
+    pthread_t thread;
+    char listener_url[128], output_url[128], discovery_url[128];
+    int discovery_port = -1, media_port = -1;
+    int ret = AVERROR(EADDRINUSE), thread_started = 0, header_written = 0;
+
+    for (int i = 0; i < 128; i++) {
+        discovery_port = 49152 + (av_get_random_seed() + i * 6151) % (65536 - 49152);
+        snprintf(listener_url, sizeof(listener_url),
+                 "tcp://127.0.0.1:%d?listen=2&listen_timeout=5000&timeout=5000000",
+                 discovery_port);
+        ret = ffurl_open_whitelist(&server.listener, listener_url, AVIO_FLAG_READ_WRITE,
+                                   NULL, NULL, NULL, NULL, NULL);
+        if (ret >= 0)
+            break;
+    }
+    if (ret < 0)
+        goto end;
+    ret = pthread_create(&thread, NULL, omt_discovery_test_server, &server);
+    if (ret) {
+        ret = AVERROR(ret);
+        goto end;
+    }
+    thread_started = 1;
+
+    for (int i = 0; i < 128; i++) {
+        media_port = 49152 + (av_get_random_seed() + i * 4421) % (65536 - 49152);
+        snprintf(output_url, sizeof(output_url), "omt://127.0.0.1:%d", media_port);
+        ret = avformat_alloc_output_context2(&format,
+                                             av_guess_format("omt", NULL, NULL),
+                                             NULL, output_url);
+        if (ret < 0)
+            goto end;
+        stream = avformat_new_stream(format, NULL);
+        if (!stream) {
+            ret = AVERROR(ENOMEM);
+            goto end;
+        }
+        stream->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
+        stream->codecpar->codec_id = AV_CODEC_ID_RAWVIDEO;
+        stream->codecpar->format = AV_PIX_FMT_UYVY422;
+        stream->codecpar->width = 2;
+        stream->codecpar->height = 2;
+        stream->time_base = (AVRational){ 1, 30 };
+        stream->r_frame_rate = stream->avg_frame_rate = (AVRational){ 30, 1 };
+        stream->sample_aspect_ratio = (AVRational){ 1, 1 };
+        snprintf(discovery_url, sizeof(discovery_url), "omt://127.0.0.1:%d", discovery_port);
+        ret = av_dict_set(&options, "discovery_server", discovery_url, 0);
+        if (ret >= 0)
+            ret = av_dict_set(&options, "source_name", "Test & Source", 0);
+        if (ret < 0)
+            goto end;
+        ret = avformat_write_header(format, &options);
+        if (ret >= 0) {
+            header_written = 1;
+            break;
+        }
+        avformat_free_context(format);
+        format = NULL;
+        if (ret != AVERROR(EADDRINUSE))
+            goto end;
+    }
+    if (!header_written)
+        goto end;
+    ret = av_write_trailer(format);
+    header_written = 0;
+    if (ret < 0)
+        goto end;
+    avformat_free_context(format);
+    format = NULL;
+    pthread_join(thread, NULL);
+    thread_started = 0;
+    if ((server.result < 0 && server.result != AVERROR_EOF) || !server.disconnected ||
+        !strstr(server.xml, "<OMTAddress>") ||
+        !strstr(server.xml, "Test &amp; Source") ||
+        !strstr(server.xml, "<Port>") ||
+        !strstr(server.xml, "<IPAddress>0.0.0.0</IPAddress>")) {
+        av_log(NULL, AV_LOG_ERROR,
+               "OMT discovery response result=%d disconnected=%d xml=%s\n",
+               server.result, server.disconnected, server.xml);
+        ret = AVERROR_INVALIDDATA;
+        goto end;
+    }
+    char port_text[32];
+    snprintf(port_text, sizeof(port_text), "<Port>%d</Port>", media_port);
+    ret = strstr(server.xml, port_text) ? 0 : AVERROR_INVALIDDATA;
+
+end:
+    av_dict_free(&options);
+    if (format) {
+        if (header_written)
+            av_write_trailer(format);
+        avformat_free_context(format);
+    }
+    ffurl_closep(&server.listener);
+    if (thread_started)
+        pthread_join(thread, NULL);
+    if (ret < 0)
+        av_log(NULL, AV_LOG_ERROR, "OMT discovery registration test failed: %s\n",
+               av_err2str(ret));
+    return ret;
 }
 
 static int omt_test_one(const OMTTestCase *test)
@@ -975,6 +1141,8 @@ int main(void)
         ret = omt_test_slow_receiver_isolation();
     if (ret >= 0)
         ret = omt_test_read_timeout();
+    if (ret >= 0)
+        ret = omt_test_discovery_register();
     vmix_p216_size = av_base64_decode(vmix_p216_packet, vmix_p216_packet_base64,
                                       sizeof(vmix_p216_packet));
     if (ret >= 0 && vmix_p216_size != 689)
