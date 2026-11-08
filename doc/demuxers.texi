@@ -1085,6 +1085,8 @@ The default value of 0 disables the timeout.
 
 Per-frame OMT XML metadata is exposed to API users in
 @code{AV_PKT_DATA_STRINGS_METADATA}, under the dictionary key @code{omt.xml}.
+OMTInfo sender attributes update the format metadata keys @code{product_name},
+@code{manufacturer}, and @code{version}.
 
 The demuxer and muxer support raw UYVY, YUY2, BGRA, BGRX, UYVA, PA16, NV12, YV12,
 and P216 video, 8-bit or 10-bit progressive VMX1 video through the @code{vmix}

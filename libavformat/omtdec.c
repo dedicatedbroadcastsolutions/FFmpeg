@@ -386,6 +386,113 @@ static int omt_parse_redirect(const char *xml, char *address, size_t address_siz
     return 0;
 }
 
+static int omt_xml_attribute(const char *xml, const char *element,
+                             const char *attribute, char *value, size_t value_size)
+{
+    char start_tag[64];
+    const char *start, *end, *cursor;
+    size_t written = 0;
+
+    if (snprintf(start_tag, sizeof(start_tag), "<%s", element) >= sizeof(start_tag))
+        return AVERROR(EINVAL);
+    start = strstr(xml, start_tag);
+    if (!start)
+        return AVERROR(EAGAIN);
+    end = strchr(start, '>');
+    if (!end)
+        return AVERROR_INVALIDDATA;
+    cursor = start + strlen(start_tag);
+    while (cursor < end) {
+        const char *name = cursor;
+        const char *name_end;
+        const char *attribute_value;
+        char quote;
+
+        while (cursor < end && (*cursor == ' ' || *cursor == '\t' ||
+                                *cursor == '\r' || *cursor == '\n' || *cursor == '/'))
+            cursor++;
+        name = cursor;
+        while (cursor < end && ((*cursor >= 'A' && *cursor <= 'Z') ||
+                                (*cursor >= 'a' && *cursor <= 'z') ||
+                                *cursor == '_'))
+            cursor++;
+        name_end = cursor;
+        while (cursor < end && (*cursor == ' ' || *cursor == '\t'))
+            cursor++;
+        if (cursor >= end || *cursor++ != '=')
+            return AVERROR_INVALIDDATA;
+        while (cursor < end && (*cursor == ' ' || *cursor == '\t'))
+            cursor++;
+        if (cursor >= end || (*cursor != '\'' && *cursor != '"'))
+            return AVERROR_INVALIDDATA;
+        quote = *cursor++;
+        attribute_value = cursor;
+        while (cursor < end && *cursor != quote)
+            cursor++;
+        if (cursor >= end)
+            return AVERROR_INVALIDDATA;
+        if ((size_t)(name_end - name) == strlen(attribute) &&
+            !memcmp(name, attribute, name_end - name)) {
+            while (attribute_value < cursor) {
+                const char *entity = NULL;
+                char decoded = 0;
+                if (*attribute_value == '&') {
+                    if (!strncmp(attribute_value, "&amp;", 5)) entity = attribute_value + 5, decoded = '&';
+                    else if (!strncmp(attribute_value, "&lt;", 4)) entity = attribute_value + 4, decoded = '<';
+                    else if (!strncmp(attribute_value, "&gt;", 4)) entity = attribute_value + 4, decoded = '>';
+                    else if (!strncmp(attribute_value, "&quot;", 6)) entity = attribute_value + 6, decoded = '"';
+                    else if (!strncmp(attribute_value, "&apos;", 6)) entity = attribute_value + 6, decoded = '\'';
+                    if (!entity)
+                        return AVERROR_INVALIDDATA;
+                }
+                if (written + 1 >= value_size)
+                    return AVERROR(ENOSPC);
+                if (entity) {
+                    value[written++] = decoded;
+                    attribute_value = entity;
+                } else {
+                    value[written++] = *attribute_value++;
+                }
+            }
+            value[written] = 0;
+            return 0;
+        }
+        cursor++;
+    }
+    return AVERROR(EAGAIN);
+}
+
+static int omt_parse_sender_info(AVFormatContext *ctx, const char *xml)
+{
+    static const char *const attributes[] = {
+        "ProductName", "Manufacturer", "Version",
+    };
+    static const char *const keys[] = {
+        "product_name", "manufacturer", "version",
+    };
+    char value[1024];
+    int ret, found = 0;
+
+    if (strncmp(xml, "<OMTInfo", 8))
+        return AVERROR(EAGAIN);
+    for (int i = 0; i < FF_ARRAY_ELEMS(attributes); i++) {
+        ret = omt_xml_attribute(xml, "OMTInfo", attributes[i], value, sizeof(value));
+        if (ret == AVERROR(EAGAIN)) {
+            av_dict_set(&ctx->metadata, keys[i], NULL, 0);
+            continue;
+        }
+        if (ret < 0)
+            return ret;
+        if ((ret = av_dict_set(&ctx->metadata, keys[i], value, 0)) < 0)
+            return ret;
+        found = 1;
+    }
+    if (!found)
+        return AVERROR_INVALIDDATA;
+    ctx->event_flags |= AVFMT_EVENT_FLAG_METADATA_UPDATED;
+    return 0;
+}
+
 static int omt_resolve_address(AVFormatContext *ctx, OMTContext *s,
                                const char *address, char *hostname,
                                size_t hostname_size, int *port)
@@ -784,6 +891,16 @@ static int omt_read_packet(AVFormatContext *ctx, AVPacket *pkt)
                 }
                 if (ret != AVERROR(EAGAIN) &&
                     !strncmp((const char *)pkt->data, "<OMTRedirect", 12)) {
+                    av_packet_unref(pkt);
+                    return ret;
+                }
+                ret = omt_parse_sender_info(ctx, (const char *)pkt->data);
+                if (ret >= 0) {
+                    av_packet_unref(pkt);
+                    continue;
+                }
+                if (ret != AVERROR(EAGAIN) &&
+                    !strncmp((const char *)pkt->data, "<OMTInfo", 8)) {
                     av_packet_unref(pkt);
                     return ret;
                 }

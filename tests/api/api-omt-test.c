@@ -47,6 +47,7 @@ typedef struct OMTTestCase {
     const char *version;
     const char *connection_metadata;
     const char *input_metadata;
+    const char *sender_info;
 } OMTTestCase;
 
 typedef struct OMTTestServer {
@@ -195,6 +196,19 @@ static void *omt_test_server(void *arg)
     AV_WL32(extended + 20, av_float2int(1.0f));
     AV_WL32(extended + 24, server->test->flags);
     AV_WL32(extended + 28, 709);
+
+    if (server->test->sender_info) {
+        memset(header, 0, sizeof(header));
+        header[0] = 1;
+        header[1] = 1;
+        AV_WL32(header + 12, strlen(server->test->sender_info) + 1);
+        ret = write_all(client, header, sizeof(header));
+        if (ret >= 0)
+            ret = write_all(client, (const uint8_t *)server->test->sender_info,
+                            strlen(server->test->sender_info) + 1);
+        if (ret < 0)
+            goto end;
+    }
 
     if (server->test->input_metadata) {
         memset(header, 0, sizeof(header));
@@ -788,6 +802,17 @@ static int omt_test_one(const OMTTestCase *test)
     ret = av_read_frame(format, packet);
     if (ret < 0)
         goto end;
+    if (test->sender_info) {
+        AVDictionaryEntry *entry = av_dict_get(format->metadata, "product_name", NULL, 0);
+        if (!entry || strcmp(entry->value, "Mock Sender") ||
+            !(entry = av_dict_get(format->metadata, "manufacturer", NULL, 0)) ||
+            strcmp(entry->value, "Test Co") ||
+            !(entry = av_dict_get(format->metadata, "version", NULL, 0)) ||
+            strcmp(entry->value, "2")) {
+            ret = AVERROR_INVALIDDATA;
+            goto end;
+        }
+    }
     if (test->input_metadata) {
         if (packet->stream_index < 0 || packet->stream_index >= format->nb_streams ||
             format->streams[packet->stream_index]->codecpar->codec_type != AVMEDIA_TYPE_DATA ||
@@ -1645,7 +1670,8 @@ int main(void)
             .manufacturer = "Open Media",
             .version = "1.0",
             .connection_metadata = "<OMTCustom Name=\"connection\" />",
-            .input_metadata = "<OMTInfo ProductName=\"Mock Sender\" />",
+            .input_metadata = "<OMTCustom Name=\"frame\" />",
+            .sender_info = "<OMTInfo ProductName=\"Mock Sender\" Manufacturer=\"Test Co\" Version=\"2\" />",
         };
         ret = omt_test_one(&metadata_test);
         if (ret >= 0)
