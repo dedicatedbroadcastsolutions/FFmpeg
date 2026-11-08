@@ -88,6 +88,7 @@ OBJS-$(CONFIG_SRTP)                      += srtp.o
 # muxers/demuxers
 OBJS-$(CONFIG_OMT_DEMUXER)               += omtdec.o
 OBJS-$(CONFIG_OMT_MUXER)                 += omten.o
+OBJS-$(CONFIG_LIBDNS_SD)                 += omtdns.o
 OBJS-$(CONFIG_A64_MUXER)                 += a64.o rawenc.o
 OBJS-$(CONFIG_AA_DEMUXER)                += aadec.o
 OBJS-$(CONFIG_AAC_DEMUXER)               += aacdec.o apetag.o img2.o rawdec.o

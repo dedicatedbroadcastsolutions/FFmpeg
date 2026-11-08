@@ -3380,7 +3380,9 @@ and register this sender for the lifetime of the muxer. Registration requires
 causes the server to remove the source.
 
 @item source_name
-Name to advertise when @option{discovery_server} is set.
+Name to advertise through discovery. When @option{discovery_server} is unset,
+the sender uses DNS-SD and requires a build configured with
+@code{--enable-libdns_sd}.
 
 @item listen_timeout
 Maximum time in milliseconds to wait for each receiver connection. Default is

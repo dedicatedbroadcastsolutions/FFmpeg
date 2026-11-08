@@ -40,6 +40,7 @@
 #include "internal.h"
 #include "mux.h"
 #include "network.h"
+#include "omtdns.h"
 #include "url.h"
 
 #define OMT_HEADER_SIZE 16
@@ -71,6 +72,7 @@ typedef struct OMTMuxContext {
     char *discovery_server;
     char *source_name;
     URLContext *discovery_tcp;
+    OMTDNSService *dns_sd;
     pthread_t discovery_thread;
     atomic_int discovery_exiting;
     int discovery_thread_started;
@@ -168,7 +170,7 @@ static int omt_open_discovery(AVFormatContext *ctx, OMTMuxContext *s)
 {
     static const char subscribe[] = "<OMTSubscribe Metadata=\"true\" />";
     char protocol[16], hostname[256], path[1024], authorization[256];
-    char tcp_url[1024], machine_name[256];
+    char tcp_url[1024], machine_name[256], source_name[64];
     AVBPrint xml;
     AVDictionary *options = NULL;
     uint8_t header[OMT_HEADER_SIZE] = { 1, 1 };
@@ -176,12 +178,51 @@ static int omt_open_discovery(AVFormatContext *ctx, OMTMuxContext *s)
     size_t xml_size;
     int port = -1, ret;
 
-    if (!s->discovery_server)
+    if (!s->discovery_server && !s->source_name)
         return 0;
     if (!s->source_name || !s->source_name[0]) {
-        av_log(ctx, AV_LOG_ERROR,
-               "source_name is required when discovery_server is configured\n");
+        av_log(ctx, AV_LOG_ERROR, "source_name is required for OMT discovery\n");
         return AVERROR(EINVAL);
+    }
+
+    if (gethostname(machine_name, sizeof(machine_name) - 1) < 0)
+        av_strlcpy(machine_name, "localhost", sizeof(machine_name));
+    machine_name[sizeof(machine_name) - 1] = 0;
+    size_t machine_len = strlen(machine_name);
+    if (machine_len + 3 >= 64)
+        return AVERROR(EINVAL);
+    size_t source_len = FFMIN(strlen(s->source_name), 63 - machine_len - 3);
+    if (source_len < strlen(s->source_name))
+        while (source_len && ((uint8_t)s->source_name[source_len] & 0xC0) == 0x80)
+            source_len--;
+    while (source_len && s->source_name[source_len - 1] == ' ')
+        source_len--;
+    if (!source_len)
+        return AVERROR(EINVAL);
+    memcpy(source_name, s->source_name, source_len);
+    source_name[source_len] = 0;
+    if (!s->discovery_server) {
+#if CONFIG_LIBDNS_SD
+        AVBPrint name;
+        char *full_name = NULL;
+
+        av_bprint_init(&name, 64, 64);
+        av_bprintf(&name, "%s (%s)", machine_name, source_name);
+        if (!av_bprint_is_complete(&name)) {
+            av_bprint_finalize(&name, NULL);
+            return AVERROR(EINVAL);
+        }
+        ret = av_bprint_finalize(&name, &full_name);
+        if (ret >= 0)
+            ret = ff_omt_dns_sd_register(&s->dns_sd, full_name,
+                                         s->listener_port, ctx);
+        av_free(full_name);
+        return ret;
+#else
+        av_log(ctx, AV_LOG_ERROR,
+               "DNS-SD is unavailable; configure with --enable-libdns_sd\n");
+        return AVERROR(ENOSYS);
+#endif
     }
 
     av_url_split(protocol, sizeof(protocol), authorization, sizeof(authorization),
@@ -209,14 +250,11 @@ static int omt_open_discovery(AVFormatContext *ctx, OMTMuxContext *s)
     if (ret < 0)
         goto end;
 
-    if (gethostname(machine_name, sizeof(machine_name) - 1) < 0)
-        av_strlcpy(machine_name, "localhost", sizeof(machine_name));
-    machine_name[sizeof(machine_name) - 1] = 0;
     av_bprint_init(&xml, 128, OMT_MAX_DISCOVERY_MESSAGE - 1);
     av_bprintf(&xml, "<OMTAddress><Name>");
     omt_xml_escape(&xml, machine_name);
     av_bprintf(&xml, " (");
-    omt_xml_escape(&xml, s->source_name);
+    omt_xml_escape(&xml, source_name);
     av_bprintf(&xml,
                ")</Name><Port>%d</Port><Addresses><IPAddress>0.0.0.0</IPAddress>"
                "</Addresses></OMTAddress>", s->listener_port);
@@ -806,6 +844,9 @@ static int omt_write_packet(AVFormatContext *ctx, AVPacket *pkt)
 static void omt_close(AVFormatContext *ctx)
 {
     OMTMuxContext *s = ctx->priv_data;
+#if CONFIG_LIBDNS_SD
+    ff_omt_dns_sd_unregister(&s->dns_sd);
+#endif
     if (s->discovery_thread_started) {
         atomic_store(&s->discovery_exiting, 1);
         pthread_join(s->discovery_thread, NULL);

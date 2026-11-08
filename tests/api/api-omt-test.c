@@ -489,6 +489,8 @@ static int omt_test_discovery_resolve(void)
     snprintf(registry_url, sizeof(registry_url), "omt://127.0.0.1:%d", registry_port);
     ret = av_dict_set(&options, "source_name", "Test Host (Camera & One)", 0);
     if (ret >= 0)
+        ret = av_dict_set(&options, "discovery_server", registry_url, 0);
+    if (ret >= 0)
         ret = av_dict_set_int(&options, "rw_timeout", 2000000, 0);
     if (ret < 0)
         goto end;

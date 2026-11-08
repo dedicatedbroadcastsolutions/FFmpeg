@@ -1059,9 +1059,9 @@ Open Media Transport (OMT) TCP demuxer.
 
 This demuxer connects directly to an OMT sender by host and port. Use
 @code{-f omt} and an input URL of the form @code{omt://@var{host}:@var{port}}.
-It can also resolve a named source through an OMT Discovery Server by setting
-@option{source_name}; in that mode the input URL identifies the registry unless
-@option{discovery_server} is set. DNS-SD browsing is not implemented yet.
+It can also resolve a named source by setting @option{source_name}. DNS-SD is
+used by default; set @option{discovery_server} to use a registry instead.
+In DNS-SD mode, the URL is ignored; use @code{omt://} with @code{-f omt}.
 
 @table @option
 @item channel
@@ -1069,12 +1069,12 @@ Select the separate OMT media connection to receive, either @code{video}
 (default) or @code{audio}.
 
 @item source_name
-Resolve this full OMT source name through a Discovery Server and connect to the
-advertised media endpoint.
+Resolve this full OMT source name through DNS-SD or an OMT Discovery Server and
+connect to the advertised media endpoint.
 
 @item discovery_server
 Discovery Server URL in the form @code{omt://@var{host}:@var{port}}. Requires
-@option{source_name}. When unset, the input URL is used as the registry URL.
+@option{source_name}. When unset, DNS-SD is used.
 
 @item rw_timeout
 Set the maximum time to wait for network reads or writes, in microseconds.
@@ -1086,9 +1086,9 @@ and P216 video, 8-bit or 10-bit progressive VMX1 video through the @code{vmix}
 decoder, and FPA1 planar floating-point audio. The muxer supports up to 64 receiver
 channel connections and queues up to eight frames per receiver. Receivers that
 cannot keep up are disconnected.
-DNS-SD browsing and advertising are not implemented. Interlaced and preview
-video and OMT alpha formats other than BGRA, UYVA, and PA16 are not supported
-yet.
+DNS-SD requires a build configured with @code{--enable-libdns_sd}. Interlaced
+and preview video and OMT alpha formats other than BGRA, UYVA, and PA16 are not
+supported yet.
 
 @section rawvideo
 

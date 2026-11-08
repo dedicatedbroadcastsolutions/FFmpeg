@@ -35,6 +35,7 @@
 #include "avformat.h"
 #include "demux.h"
 #include "internal.h"
+#include "omtdns.h"
 #include "url.h"
 
 #define OMT_HEADER_SIZE 16
@@ -286,8 +287,27 @@ static int omt_open(AVFormatContext *ctx)
     int port = -1, ret;
 
     if (s->source_name) {
-        const char *server_url = s->discovery_server ? s->discovery_server : ctx->url;
-        ret = omt_resolve_source(ctx, s, server_url, hostname, sizeof(hostname), &port);
+        if (s->discovery_server) {
+            ret = omt_resolve_source(ctx, s, s->discovery_server,
+                                     hostname, sizeof(hostname), &port);
+        }
+#if CONFIG_LIBDNS_SD
+        if (!s->discovery_server || (ret < 0 && ret != AVERROR_EXIT)) {
+            if (s->discovery_server)
+              av_log(ctx, AV_LOG_VERBOSE,
+                  "Discovery Server lookup failed; trying DNS-SD\n");
+            ret = ff_omt_dns_sd_resolve(s->source_name, hostname, sizeof(hostname),
+                                        &port, &ctx->interrupt_callback,
+                                        s->rw_timeout ? s->rw_timeout : 5 * AV_TIME_BASE,
+                                        ctx);
+        }
+#else
+        if (!s->discovery_server) {
+            av_log(ctx, AV_LOG_ERROR,
+                   "DNS-SD is unavailable; configure with --enable-libdns_sd\n");
+            ret = AVERROR(ENOSYS);
+        }
+#endif
         if (ret < 0) {
             av_log(ctx, AV_LOG_ERROR, "Could not resolve OMT source '%s': %s\n",
                    s->source_name, av_err2str(ret));
