@@ -1413,9 +1413,20 @@ follows.
 @section vmix
 
 The native VMIX encoder produces progressive 8-bit YUV 4:2:2 video in the
-OMT_SQ profile at fixed quality 80. Input dimensions must be multiples of 16,
-with a maximum size of 7680x4080. The encoder currently does not support
-interlaced video, alpha, high bit depth, or configurable quality.
+OMT_SQ profile by default. Input dimensions must be multiples of 16, with a
+maximum size of 7680x4080. The encoder currently does not support interlaced
+video, alpha, high bit depth, or bitrate control.
+
+@table @option
+@item omt_profile
+Set the OMT VMX profile. Possible values are @code{low}, @code{medium}, and
+@code{high}, corresponding to OMT_LQ, OMT_SQ, and OMT_HQ. The default is
+@code{medium}.
+
+@item omt_quality
+Set VMX quality from 52 to 98. The default is 80. The encoder maps requested
+values to the nearest quantization preset supported by the VMX bitstream.
+@end table
 
 @section a64_multi, a64_multi5
 

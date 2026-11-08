@@ -178,12 +178,14 @@ end:
     return ret;
 }
 
-static int test_encode_roundtrip(void)
+static int test_encode_roundtrip(const char *profile, int quality,
+                                 uint8_t expected_dc_shift, int expected_quality)
 {
     const AVCodec *encoder = avcodec_find_encoder(AV_CODEC_ID_VMIX);
     AVCodecContext *encoder_ctx = NULL, *decoder_ctx = NULL;
     AVFrame *source = NULL, *decoded = NULL;
     AVPacket *packet = NULL;
+    AVDictionary *options = NULL;
     int ret;
 
     if (!encoder)
@@ -203,10 +205,14 @@ static int test_encode_roundtrip(void)
     source->format = AV_PIX_FMT_YUV422P;
     source->width = 16;
     source->height = 16;
-    if ((ret = avcodec_open2(encoder_ctx, encoder, NULL)) < 0 ||
+    if (profile && (ret = av_dict_set(&options, "omt_profile", profile, 0)) < 0)
+        goto end;
+    if ((ret = av_dict_set_int(&options, "omt_quality", quality, 0)) < 0 ||
+        (ret = avcodec_open2(encoder_ctx, encoder, &options)) < 0 ||
         (ret = av_frame_get_buffer(source, 32)) < 0 ||
         (ret = open_decoder(&decoder_ctx, 16, 16, 8)) < 0)
         goto end;
+    av_dict_free(&options);
     for (int pattern = 0; pattern < 2; pattern++) {
         int max_error = 0;
         int error_plane = 0, error_x = 0, error_y = 0;
@@ -233,6 +239,12 @@ static int test_encode_roundtrip(void)
             (ret = avcodec_send_packet(decoder_ctx, packet)) < 0 ||
             (ret = avcodec_receive_frame(decoder_ctx, decoded)) < 0)
             goto end;
+        if (packet->size <= 5 || packet->data[0] != 3 ||
+            packet->data[1] != expected_dc_shift ||
+            packet->data[3] != expected_quality) {
+            ret = AVERROR_INVALIDDATA;
+            goto end;
+        }
         if (decoded->format != AV_PIX_FMT_YUV422P) {
             ret = AVERROR_INVALIDDATA;
             goto end;
@@ -255,7 +267,7 @@ static int test_encode_roundtrip(void)
                 }
             }
         }
-        if (max_error > 64) {
+        if (max_error > (quality < 80 ? 128 : 64)) {
             av_log(NULL, AV_LOG_ERROR,
                    "VMIX encoder roundtrip %d max error %d at plane %d (%d,%d): %d vs %d\n",
                    pattern, max_error, error_plane, error_x, error_y,
@@ -266,6 +278,7 @@ static int test_encode_roundtrip(void)
     }
 
 end:
+    av_dict_free(&options);
     av_packet_free(&packet);
     av_frame_free(&decoded);
     av_frame_free(&source);
@@ -346,7 +359,9 @@ int main(void)
     if (ret >= 0)
         ret = test_p216();
     if (ret >= 0)
-        ret = test_encode_roundtrip();
+        ret = test_encode_roundtrip(NULL, 80, 3, 80);
+    if (ret >= 0)
+        ret = test_encode_roundtrip("high", 60, 0, 60);
 
 end:
     av_frame_free(&frame);

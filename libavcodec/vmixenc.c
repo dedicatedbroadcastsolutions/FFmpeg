@@ -24,6 +24,7 @@
 #include "libavutil/common.h"
 #include "libavutil/mem.h"
 #include "libavutil/mem_internal.h"
+#include "libavutil/opt.h"
 
 #include "avcodec.h"
 #include "codec_internal.h"
@@ -34,9 +35,7 @@
 #include "put_bits.h"
 #include "put_golomb.h"
 
-#define VMIX_QUALITY 80
-#define VMIX_QUALITY_SCALE 20
-#define VMIX_DC_SHIFT 3
+#define VMIX_QUALITY_DEFAULT 80
 /* FFmpeg's FDCT output is scaled by 8 relative to the VMX encoder. */
 #define VMIX_FDCT_SCALE 8
 #define VMIX_MAX_PACKET_SIZE (256 * 1024 * 1024)
@@ -49,8 +48,43 @@ typedef struct VMIXEncodeSlice {
 } VMIXEncodeSlice;
 
 typedef struct VMIXEncContext {
+    const AVClass *class;
     FDCTDSPContext fdsp;
+    int profile;
+    int quality;
+    int quality_scale;
+    int dc_shift;
 } VMIXEncContext;
+
+enum VMIXProfile {
+        VMIX_PROFILE_OMT_LQ,
+        VMIX_PROFILE_OMT_SQ,
+        VMIX_PROFILE_OMT_HQ,
+};
+
+#define OFFSET(x) offsetof(VMIXEncContext, x)
+#define VE AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_ENCODING_PARAM
+static const AVOption vmix_options[] = {
+        { "omt_profile", "OMT VMX profile", OFFSET(profile), AV_OPT_TYPE_INT,
+            { .i64 = VMIX_PROFILE_OMT_SQ }, VMIX_PROFILE_OMT_LQ, VMIX_PROFILE_OMT_HQ,
+            VE, .unit = "omt_profile" },
+        { "low", NULL, 0, AV_OPT_TYPE_CONST, { .i64 = VMIX_PROFILE_OMT_LQ }, 0, 0,
+            VE, .unit = "omt_profile" },
+        { "medium", NULL, 0, AV_OPT_TYPE_CONST, { .i64 = VMIX_PROFILE_OMT_SQ }, 0, 0,
+            VE, .unit = "omt_profile" },
+        { "high", NULL, 0, AV_OPT_TYPE_CONST, { .i64 = VMIX_PROFILE_OMT_HQ }, 0, 0,
+            VE, .unit = "omt_profile" },
+        { "omt_quality", "VMX quality (52-98)", OFFSET(quality), AV_OPT_TYPE_INT,
+            { .i64 = VMIX_QUALITY_DEFAULT }, 52, 98, VE },
+        { NULL }
+};
+
+static const AVClass vmix_class = {
+        .class_name = "vmix encoder",
+        .item_name  = av_default_item_name,
+        .option     = vmix_options,
+        .version    = LIBAVUTIL_VERSION_INT,
+};
 
 static const uint8_t quant[64] = {
     16, 16, 19, 22, 26, 27, 29, 34,
@@ -62,6 +96,30 @@ static const uint8_t quant[64] = {
     26, 27, 29, 34, 38, 46, 56, 69,
     27, 29, 35, 38, 46, 56, 69, 83,
 };
+
+static const uint8_t vmix_quality_scales[] = {
+    1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 18,
+    20, 22, 24, 28, 32, 36, 40, 44, 48, 52, 56, 64,
+};
+
+static int vmix_quality_scale(int quality)
+{
+    int scale = 100 - quality;
+
+    for (int i = 0; i < FF_ARRAY_ELEMS(vmix_quality_scales); i++)
+        if (vmix_quality_scales[i] >= scale)
+            return vmix_quality_scales[i];
+    return vmix_quality_scales[FF_ARRAY_ELEMS(vmix_quality_scales) - 1];
+}
+
+static int vmix_profile_dc_shift(int profile, int height)
+{
+    if (profile == VMIX_PROFILE_OMT_HQ)
+        return 0;
+    if (profile == VMIX_PROFILE_OMT_SQ && height >= 1080 && height < 2160)
+        return 0;
+    return 3;
+}
 
 static int vmix_round_shift(int value, int shift)
 {
@@ -117,7 +175,7 @@ static int vmix_encode_plane(VMIXEncContext *s, PutBitContext *dc_pb,
             s->fdsp.fdct(block);
 
             int dc = vmix_round_shift(vmix_quantize(block[0], quant[0]),
-                                      VMIX_DC_SHIFT + 3);
+                                      s->dc_shift + 3);
             int dc_delta = dc - dc_predictor;
             if (!dc_delta) {
                 dc_run++;
@@ -133,7 +191,7 @@ static int vmix_encode_plane(VMIXEncContext *s, PutBitContext *dc_pb,
             for (int n = 0; n < 64; n++) {
                 int index = ff_zigzag_direct[n];
                 int level = index ? vmix_quantize(block[index],
-                                                   quant[index] * VMIX_QUALITY_SCALE * VMIX_FDCT_SCALE) : 0;
+                                                   quant[index] * s->quality_scale * VMIX_FDCT_SCALE) : 0;
                 if (!level) {
                     ac_run++;
                 } else {
@@ -168,6 +226,8 @@ static av_cold int vmix_encode_init(AVCodecContext *avctx)
         return AVERROR(EINVAL);
     }
     avctx->bits_per_raw_sample = 8;
+    s->quality_scale = vmix_quality_scale(s->quality);
+    s->dc_shift = vmix_profile_dc_shift(s->profile, avctx->height);
     ff_fdctdsp_init(&s->fdsp, avctx);
     return 0;
 }
@@ -238,9 +298,9 @@ static int vmix_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
     if (ret < 0)
         goto end;
     pkt->data[0] = 3;
-    pkt->data[1] = VMIX_DC_SHIFT;
+    pkt->data[1] = s->dc_shift;
     pkt->data[2] = 1;
-    pkt->data[3] = VMIX_QUALITY;
+    pkt->data[3] = 100 - s->quality_scale;
     pkt->data[4] = nb_slices;
     size_t offset = 5;
     for (int i = 0; i < nb_slices; i++) {
@@ -274,6 +334,7 @@ const FFCodec ff_vmix_encoder = {
     CODEC_LONG_NAME("vMix Video"),
     .p.type           = AVMEDIA_TYPE_VIDEO,
     .p.id             = AV_CODEC_ID_VMIX,
+    .p.priv_class     = &vmix_class,
     .priv_data_size   = sizeof(VMIXEncContext),
     .init             = vmix_encode_init,
     FF_CODEC_ENCODE_CB(vmix_encode_frame),
