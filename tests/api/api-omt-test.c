@@ -124,7 +124,7 @@ static int omt_test_one(const OMTTestCase *test)
     for (int i = 0; i < 128; i++) {
         port = 49152 + (av_get_random_seed() + i * 7919) % (65536 - 49152);
         snprintf(listen_url, sizeof(listen_url),
-                 "tcp://127.0.0.1:%d?listen=2&listen_timeout=5000000&timeout=5000000",
+                 "tcp://127.0.0.1:%d?listen=2&listen_timeout=5000&timeout=5000000",
                  port);
         ret = ffurl_open_whitelist(&server.listener, listen_url,
                                    AVIO_FLAG_READ_WRITE, NULL, NULL,
