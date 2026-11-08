@@ -42,6 +42,11 @@ typedef struct OMTTestCase {
     const uint8_t *expected_data;
     int expected_size;
     const char *metadata;
+    const char *product_name;
+    const char *manufacturer;
+    const char *version;
+    const char *connection_metadata;
+    const char *input_metadata;
 } OMTTestCase;
 
 typedef struct OMTTestServer {
@@ -158,6 +163,19 @@ static void *omt_test_server(void *arg)
     AV_WL32(extended + 20, av_float2int(1.0f));
     AV_WL32(extended + 24, server->test->flags);
     AV_WL32(extended + 28, 709);
+
+    if (server->test->input_metadata) {
+        memset(header, 0, sizeof(header));
+        header[0] = 1;
+        header[1] = 1;
+        AV_WL32(header + 12, strlen(server->test->input_metadata) + 1);
+        ret = write_all(client, header, sizeof(header));
+        if (ret >= 0)
+            ret = write_all(client, (const uint8_t *)server->test->input_metadata,
+                            strlen(server->test->input_metadata) + 1);
+        if (ret < 0)
+            goto end;
+    }
 
     memset(header, 0, sizeof(header));
     header[0] = 1;
@@ -604,9 +622,24 @@ static int omt_test_one(const OMTTestCase *test)
     ret = av_read_frame(format, packet);
     if (ret < 0)
         goto end;
-    if (format->nb_streams != 1 ||
-        format->streams[0]->codecpar->codec_id != codec_id ||
-        format->streams[0]->codecpar->format != test->pixel_format ||
+    if (test->input_metadata) {
+        if (packet->stream_index < 0 || packet->stream_index >= format->nb_streams ||
+            format->streams[packet->stream_index]->codecpar->codec_type != AVMEDIA_TYPE_DATA ||
+            packet->size != strlen(test->input_metadata) + 1 ||
+            memcmp(packet->data, test->input_metadata, packet->size - 1) ||
+            packet->data[packet->size - 1]) {
+            ret = AVERROR_INVALIDDATA;
+            goto end;
+        }
+        av_packet_unref(packet);
+        ret = av_read_frame(format, packet);
+        if (ret < 0)
+            goto end;
+    }
+    int video_index = test->input_metadata ? 1 : 0;
+    if (format->nb_streams != video_index + 1 ||
+        format->streams[video_index]->codecpar->codec_id != codec_id ||
+        format->streams[video_index]->codecpar->format != test->pixel_format ||
         packet->size != test->expected_size ||
         memcmp(packet->data, test->expected_data, test->expected_size))
         ret = AVERROR_INVALIDDATA;
@@ -812,8 +845,22 @@ static int omt_test_mux_one(const OMTTestCase *test)
         stream->r_frame_rate = (AVRational){ 30, 1 };
         stream->avg_frame_rate = (AVRational){ 30, 1 };
         stream->sample_aspect_ratio = (AVRational){ 1, 1 };
+        if (test->product_name &&
+            (ret = av_dict_set(&format->metadata, "product_name", test->product_name, 0)) < 0)
+            goto end;
+        if (test->manufacturer &&
+            (ret = av_dict_set(&format->metadata, "manufacturer", test->manufacturer, 0)) < 0)
+            goto end;
+        if (test->version &&
+            (ret = av_dict_set(&format->metadata, "version", test->version, 0)) < 0)
+            goto end;
+        if (test->connection_metadata &&
+            (ret = av_dict_set(&options, "connection_metadata",
+                               test->connection_metadata, 0)) < 0)
+            goto end;
         stage = "write output header";
-        ret = avformat_write_header(format, NULL);
+        ret = avformat_write_header(format, &options);
+        av_dict_free(&options);
         if (ret >= 0) {
             header_written = 1;
             break;
@@ -848,6 +895,41 @@ static int omt_test_mux_one(const OMTTestCase *test)
     if (ret < 0)
         goto end;
     av_usleep(100000);
+
+    int sender_info = test->product_name || test->manufacturer || test->version;
+    int initial_metadata_count = sender_info + !!test->connection_metadata;
+    for (int i = 0; i < initial_metadata_count; i++) {
+        stage = "read OMT sender information";
+        ret = ffurl_read_complete(client, header, sizeof(header));
+        if (ret < 0 || ret != sizeof(header)) {
+            ret = ret < 0 ? ret : AVERROR_EOF;
+            goto end;
+        }
+        size = AV_RL32(header + 12);
+        if (header[0] != 1 || header[1] != 1 || AV_RL16(header + 10) ||
+            size <= 1 || size >= sizeof(wire_data)) {
+            ret = AVERROR_INVALIDDATA;
+            goto end;
+        }
+        ret = ffurl_read_complete(client, wire_data, size);
+        if (ret < 0 || ret != size || wire_data[size - 1]) {
+            ret = ret < 0 ? ret : AVERROR_INVALIDDATA;
+            goto end;
+        }
+        if (sender_info && i == 0) {
+            if (!strstr((const char *)wire_data, "<OMTInfo") ||
+                (test->product_name &&
+                 !strstr((const char *)wire_data, "FFmpeg &amp; OMT")) ||
+                (test->manufacturer && !strstr((const char *)wire_data, test->manufacturer)) ||
+                (test->version && !strstr((const char *)wire_data, test->version))) {
+                ret = AVERROR_INVALIDDATA;
+                goto end;
+            }
+        } else if (strcmp((const char *)wire_data, test->connection_metadata)) {
+            ret = AVERROR_INVALIDDATA;
+            goto end;
+        }
+    }
 
     packet = av_packet_alloc();
     stage = "allocate test packet";
@@ -1366,6 +1448,11 @@ int main(void)
             .expected_data = uyvy,
             .expected_size = sizeof(uyvy),
             .metadata = frame_metadata,
+            .product_name = "FFmpeg & OMT",
+            .manufacturer = "Open Media",
+            .version = "1.0",
+            .connection_metadata = "<OMTCustom Name=\"connection\" />",
+            .input_metadata = "<OMTInfo ProductName=\"Mock Sender\" />",
         };
         ret = omt_test_one(&metadata_test);
         if (ret >= 0)

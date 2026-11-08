@@ -74,6 +74,7 @@ typedef struct OMTMuxContext {
     int thread_started;
     char *discovery_server;
     char *source_name;
+    char *connection_metadata;
     URLContext *discovery_tcp;
     OMTDNSService *dns_sd;
     pthread_t discovery_thread;
@@ -101,6 +102,8 @@ static const AVOption omt_mux_options[] = {
         { "discovery_server", "OMT discovery server URL", OFFSET(discovery_server),
             AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, E },
         { "source_name", "source name advertised to OMT discovery", OFFSET(source_name),
+            AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, E },
+        { "connection_metadata", "XML metadata sent to each new OMT receiver", OFFSET(connection_metadata),
             AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, E },
         { NULL }
 };
@@ -500,6 +503,73 @@ static int omt_open_listener(AVFormatContext *ctx)
                                 ctx->protocol_whitelist, ctx->protocol_blacklist, NULL);
 }
 
+static int omt_queue_xml(OMTReceiver *receiver, const char *xml)
+{
+    AVPacket *pkt = NULL;
+    size_t xml_size = strlen(xml) + 1;
+    int ret;
+
+    if (xml_size > OMT_MAX_DISCOVERY_MESSAGE)
+        return AVERROR(EINVAL);
+    ret = omt_make_frame_packet(&pkt, 1, 0, NULL, 0,
+                                (const uint8_t *)xml, xml_size, NULL, 0);
+    if (ret < 0)
+        return ret;
+    ret = av_thread_message_queue_send(receiver->queue, &pkt, 0);
+    if (ret < 0)
+        av_packet_free(&pkt);
+    return ret;
+}
+
+static int omt_queue_sender_info(AVFormatContext *ctx, OMTMuxContext *s,
+                                 OMTReceiver *receiver)
+{
+    const AVDictionaryEntry *product, *manufacturer, *version;
+    AVBPrint xml;
+    char *xml_data = NULL;
+    int ret;
+
+    product = av_dict_get(ctx->metadata, "product_name", NULL, 0);
+    manufacturer = av_dict_get(ctx->metadata, "manufacturer", NULL, 0);
+    version = av_dict_get(ctx->metadata, "version", NULL, 0);
+    if (product || manufacturer || version) {
+        av_bprint_init(&xml, 128, 4096);
+        av_bprintf(&xml, "<OMTInfo");
+        if (product) {
+            av_bprintf(&xml, " ProductName=\"");
+            omt_xml_escape(&xml, product->value);
+            av_bprintf(&xml, "\"");
+        }
+        if (manufacturer) {
+            av_bprintf(&xml, " Manufacturer=\"");
+            omt_xml_escape(&xml, manufacturer->value);
+            av_bprintf(&xml, "\"");
+        }
+        if (version) {
+            av_bprintf(&xml, " Version=\"");
+            omt_xml_escape(&xml, version->value);
+            av_bprintf(&xml, "\"");
+        }
+        av_bprintf(&xml, " />");
+        if (!av_bprint_is_complete(&xml)) {
+            av_bprint_finalize(&xml, NULL);
+            return AVERROR(EINVAL);
+        }
+        ret = av_bprint_finalize(&xml, &xml_data);
+        if (ret < 0)
+            return ret;
+        ret = omt_queue_xml(receiver, xml_data);
+        av_free(xml_data);
+        if (ret < 0)
+            return ret;
+    }
+    if (s->connection_metadata && s->connection_metadata[0])
+        ret = omt_queue_xml(receiver, s->connection_metadata);
+    else
+        ret = 0;
+    return ret;
+}
+
 static void *omt_accept_thread(void *arg)
 {
     AVFormatContext *ctx = arg;
@@ -547,6 +617,11 @@ static void *omt_accept_thread(void *arg)
         atomic_init(&receiver->failed, 0);
         atomic_init(&receiver->finished, 0);
         atomic_init(&receiver->error, 0);
+        ret = omt_queue_sender_info(ctx, s, receiver);
+        if (ret < 0) {
+            omt_receiver_stop(receiver);
+            continue;
+        }
         ret = pthread_create(&receiver->thread, NULL, omt_receiver_thread, receiver);
         if (ret) {
             omt_receiver_stop(receiver);

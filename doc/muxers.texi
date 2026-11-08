@@ -3383,6 +3383,9 @@ causes the server to remove the source.
 Name to advertise through discovery. When @option{discovery_server} is unset,
 the sender uses native IPv4 multicast DNS. IPv6 DNS-SD is not advertised yet.
 
+@item connection_metadata
+NUL-terminated UTF-8 XML sent to every new receiver as a metadata frame.
+
 @item listen_timeout
 Maximum time in milliseconds to wait for each receiver connection. Default is
 30000.
@@ -3390,6 +3393,8 @@ Maximum time in milliseconds to wait for each receiver connection. Default is
 
 API users can attach per-frame OMT XML metadata by placing it in
 @code{AV_PKT_DATA_STRINGS_METADATA} under the dictionary key @code{omt.xml}.
+Format metadata keys @code{product_name}, @code{manufacturer}, and @code{version}
+are sent as an @code{OMTInfo} metadata frame to new receivers.
 
 @section mxf, mxf_d10, mxf_opatom
 

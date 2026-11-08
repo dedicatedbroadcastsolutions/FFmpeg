@@ -56,6 +56,7 @@ typedef struct OMTContext {
     const AVClass *class;
     URLContext *tcp;
     AVStream *stream;
+    AVStream *metadata_stream;
     int channel;
     uint32_t codec_tag;
     int width;
@@ -613,6 +614,23 @@ static int omt_add_audio_stream(AVFormatContext *ctx, const uint8_t *header)
     return 0;
 }
 
+static int omt_add_metadata_stream(AVFormatContext *ctx)
+{
+    OMTContext *s = ctx->priv_data;
+    AVStream *st;
+
+    if (s->metadata_stream)
+        return 0;
+    st = avformat_new_stream(ctx, NULL);
+    if (!st)
+        return AVERROR(ENOMEM);
+    st->codecpar->codec_type = AVMEDIA_TYPE_DATA;
+    st->codecpar->codec_id = AV_CODEC_ID_BIN_DATA;
+    avpriv_set_pts_info(st, 64, 1, OMT_TIME_BASE);
+    s->metadata_stream = st;
+    return 0;
+}
+
 static int omt_read_packet(AVFormatContext *ctx, AVPacket *pkt)
 {
     OMTContext *s = ctx->priv_data;
@@ -636,6 +654,22 @@ static int omt_read_packet(AVFormatContext *ctx, AVPacket *pkt)
         timestamp = AV_RL64(header + 2);
         if (data_length > OMT_MAX_FRAME_SIZE || data_length < metadata_length)
             return AVERROR_INVALIDDATA;
+        if (header[1] == 1) {
+            ret = omt_add_metadata_stream(ctx);
+            if (ret < 0)
+                return ret;
+            ret = av_new_packet(pkt, data_length);
+            if (ret < 0)
+                return ret;
+            ret = ffurl_read_complete(s->tcp, pkt->data, data_length);
+            if (ret < 0 || ret != data_length) {
+                av_packet_unref(pkt);
+                return ret < 0 ? ret : AVERROR_EOF;
+            }
+            pkt->stream_index = s->metadata_stream->index;
+            pkt->pts = pkt->dts = timestamp;
+            return 0;
+        }
         if (header[1] != (s->channel == OMT_CHANNEL_VIDEO ? 2 : 4)) {
             ret = omt_skip(s->tcp, data_length);
             if (ret < 0)
