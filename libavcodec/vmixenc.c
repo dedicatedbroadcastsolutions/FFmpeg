@@ -135,6 +135,49 @@ static int vmix_quantize(int value, int divisor)
     return av_clip_int16(scaled < 0 ? -level : level);
 }
 
+static int vmix_shift_8(int value)
+{
+    return value < 0 ? -((-value + 255) >> 8) : value >> 8;
+}
+
+static int vmix_rgb_component(const uint8_t *pixel, const int16_t coeff[3], int offset)
+{
+    int b = pixel[0], g = pixel[1], r = pixel[2];
+    int sum = r * coeff[0] + g * coeff[1] + b * coeff[2] + 128;
+    return av_clip_uint8(vmix_shift_8(sum) + offset);
+}
+
+static void vmix_bgr0_to_yuv422(const AVFrame *frame, AVFrame *planar)
+{
+    static const int16_t coeff_601[3][3] = {
+        { 66, 129, 25 }, { -38, -74, 112 }, { 112, -94, -18 },
+    };
+    static const int16_t coeff_709[3][3] = {
+        { 47, 157, 16 }, { -26, -86, 112 }, { 112, -102, -10 },
+    };
+    int is_709 = frame->colorspace == AVCOL_SPC_BT709 ||
+                 (frame->colorspace == AVCOL_SPC_UNSPECIFIED && frame->height >= 720);
+    const int16_t (*coeff)[3] = is_709 ? coeff_709 : coeff_601;
+
+    for (int y = 0; y < frame->height; y++) {
+        const uint8_t *src = frame->data[0] + (ptrdiff_t)y * frame->linesize[0];
+        uint8_t *y_dst = planar->data[0] + (ptrdiff_t)y * planar->linesize[0];
+        uint8_t *u_dst = planar->data[1] + (ptrdiff_t)y * planar->linesize[1];
+        uint8_t *v_dst = planar->data[2] + (ptrdiff_t)y * planar->linesize[2];
+
+        for (int x = 0; x < frame->width; x += 2) {
+            const uint8_t *pixel0 = src + x * 4;
+            const uint8_t *pixel1 = pixel0 + 4;
+            y_dst[x] = vmix_rgb_component(pixel0, coeff[0], 16);
+            y_dst[x + 1] = vmix_rgb_component(pixel1, coeff[0], 16);
+            u_dst[x / 2] = (vmix_rgb_component(pixel0, coeff[1], 128) +
+                            vmix_rgb_component(pixel1, coeff[1], 128)) >> 1;
+            v_dst[x / 2] = (vmix_rgb_component(pixel0, coeff[2], 128) +
+                            vmix_rgb_component(pixel1, coeff[2], 128)) >> 1;
+        }
+    }
+}
+
 static void vmix_put_signed(PutBitContext *pb, int value)
 {
     uint32_t magnitude = value < 0 ? -(int64_t)value : value;
@@ -221,12 +264,13 @@ static av_cold int vmix_encode_init(AVCodecContext *avctx)
          avctx->pix_fmt != AV_PIX_FMT_UYVY422 &&
             avctx->pix_fmt != AV_PIX_FMT_YUYV422 &&
             avctx->pix_fmt != AV_PIX_FMT_NV12 &&
-            avctx->pix_fmt != AV_PIX_FMT_YUV420P) ||
+             avctx->pix_fmt != AV_PIX_FMT_YUV420P &&
+             avctx->pix_fmt != AV_PIX_FMT_BGR0) ||
         avctx->width < 16 || avctx->height < 16 ||
         avctx->width > 7680 || avctx->height > 4080 ||
         avctx->width % 16 || avctx->height % 16) {
         av_log(avctx, AV_LOG_ERROR,
-               "VMIX encoder requires YUV422P, UYVY422, YUYV422, NV12, or YUV420P dimensions divisible by 16\n");
+               "VMIX encoder requires YUV422P, UYVY422, YUYV422, NV12, YUV420P, or BGR0 dimensions divisible by 16\n");
         return AVERROR(EINVAL);
     }
     avctx->bits_per_raw_sample = 8;
@@ -274,6 +318,9 @@ static int vmix_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
             FFABS(frame->linesize[0]) < frame->width ||
             FFABS(frame->linesize[1]) < frame->width / 2 ||
             FFABS(frame->linesize[2]) < frame->width / 2)
+            return AVERROR(EINVAL);
+    } else if (frame->format == AV_PIX_FMT_BGR0) {
+        if (!frame->data[0] || FFABS(frame->linesize[0]) < frame->width * 4)
             return AVERROR(EINVAL);
     } else if (!frame->data[0] || FFABS(frame->linesize[0]) < frame->width * 2) {
         return AVERROR(EINVAL);
@@ -333,6 +380,8 @@ static int vmix_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
                     v0[x] = v1[x] = v[frame->format == AV_PIX_FMT_NV12 ? source_x : x];
                 }
             }
+        } else if (frame->format == AV_PIX_FMT_BGR0) {
+            vmix_bgr0_to_yuv422(frame, &planar_frame);
         } else {
             for (int y = 0; y < frame->height; y++) {
                 const uint8_t *src = frame->data[0] + (ptrdiff_t)y * frame->linesize[0];
@@ -427,5 +476,5 @@ const FFCodec ff_vmix_encoder = {
     .init             = vmix_encode_init,
     FF_CODEC_ENCODE_CB(vmix_encode_frame),
     CODEC_PIXFMTS(AV_PIX_FMT_YUV422P, AV_PIX_FMT_UYVY422, AV_PIX_FMT_YUYV422,
-                  AV_PIX_FMT_NV12, AV_PIX_FMT_YUV420P),
+                  AV_PIX_FMT_NV12, AV_PIX_FMT_YUV420P, AV_PIX_FMT_BGR0),
 };

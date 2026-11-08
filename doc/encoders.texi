@@ -1413,10 +1413,11 @@ follows.
 @section vmix
 
 The native VMIX encoder produces progressive 8-bit 4:2:2 video from
-@code{yuv422p}, @code{uyvy422}, @code{yuyv422}, @code{nv12}, or
-@code{yuv420p} input in the OMT_SQ profile by default. Input dimensions must be
-multiples of 16, with a maximum size of 7680x4080. The encoder currently does
-not support interlaced video, alpha, high bit depth, or bitrate control.
+@code{yuv422p}, @code{uyvy422}, @code{yuyv422}, @code{nv12},
+@code{yuv420p}, or @code{bgr0} input in the OMT_SQ profile by default. Input
+dimensions must be multiples of 16, with a maximum size of 7680x4080. The
+encoder currently does not support interlaced video, alpha, high bit depth, or
+bitrate control.
 
 @table @option
 @item omt_profile

@@ -258,6 +258,15 @@ static int test_encode_roundtrip(const char *profile, int quality,
                     }
                 }
             }
+        } else if (pixel_format == AV_PIX_FMT_BGR0) {
+            for (int y = 0; y < 16; y++) {
+                uint8_t *row = source->data[0] + y * source->linesize[0];
+                for (int x = 0; x < 16; x++) {
+                    uint8_t value = pattern ? 16 + (x * 7 + y * 5) % 220 : 80;
+                    row[x * 4] = row[x * 4 + 1] = row[x * 4 + 2] = value;
+                    row[x * 4 + 3] = 0;
+                }
+            }
         } else {
             for (int y = 0; y < 16; y++) {
                 uint8_t *row = source->data[0] + y * source->linesize[0];
@@ -320,6 +329,13 @@ static int test_encode_roundtrip(const char *profile, int quality,
                         } else {
                             source_value = source->data[plane][chroma_y *
                                 source->linesize[plane] + x];
+                        }
+                    } else if (pixel_format == AV_PIX_FMT_BGR0) {
+                        if (plane) {
+                            source_value = 128;
+                        } else {
+                            const uint8_t *row = source->data[0] + y * source->linesize[0];
+                            source_value = ((row[x * 4] * 220 + 128) >> 8) + 16;
                         }
                     } else {
                         const uint8_t *row = source->data[0] + y * source->linesize[0];
@@ -443,6 +459,8 @@ int main(void)
         ret = test_encode_roundtrip(NULL, 80, 3, 80, AV_PIX_FMT_NV12);
     if (ret >= 0)
         ret = test_encode_roundtrip("low", 60, 3, 60, AV_PIX_FMT_YUV420P);
+    if (ret >= 0)
+        ret = test_encode_roundtrip(NULL, 80, 3, 80, AV_PIX_FMT_BGR0);
 
 end:
     av_frame_free(&frame);
