@@ -23,6 +23,8 @@
 #include "libavutil/intreadwrite.h"
 #include "libavutil/random_seed.h"
 #include "libavutil/thread.h"
+#include "libavutil/dict.h"
+#include "libavutil/time.h"
 
 #include "libavcodec/avcodec.h"
 #include "libavformat/avformat.h"
@@ -168,6 +170,158 @@ end:
     return ret;
 }
 
+static int omt_test_mux_one(const OMTTestCase *test)
+{
+    AVFormatContext *format = NULL;
+    AVPacket *packet = NULL;
+    URLContext *client = NULL;
+    AVDictionary *options = NULL;
+    AVStream *stream;
+    char output_url[128], tcp_url[128];
+    uint8_t header[16], extended[32], wire_data[128];
+    uint32_t size;
+    int port = -1, ret = AVERROR(EADDRINUSE), header_written = 0;
+    const char *stage = "allocate output";
+
+    for (int i = 0; i < 128; i++) {
+        port = 49152 + (av_get_random_seed() + i * 6151) % (65536 - 49152);
+        snprintf(output_url, sizeof(output_url), "omt://127.0.0.1:%d", port);
+        ret = avformat_alloc_output_context2(&format,
+                                             av_guess_format("omt", NULL, NULL),
+                                             NULL, output_url);
+        if (ret < 0)
+            goto end;
+        stage = "create stream";
+        stream = avformat_new_stream(format, NULL);
+        if (!stream) {
+            ret = AVERROR(ENOMEM);
+            goto end;
+        }
+        stream->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
+        stream->codecpar->codec_id = AV_CODEC_ID_RAWVIDEO;
+        stream->codecpar->format = test->pixel_format;
+        stream->codecpar->width = 2;
+        stream->codecpar->height = 2;
+        stream->codecpar->bits_per_raw_sample =
+            test->pixel_format == AV_PIX_FMT_YUVA422P10LE ? 10 : 8;
+        stream->time_base = (AVRational){ 1, 30 };
+        stream->r_frame_rate = (AVRational){ 30, 1 };
+        stream->avg_frame_rate = (AVRational){ 30, 1 };
+        stream->sample_aspect_ratio = (AVRational){ 1, 1 };
+        stage = "write output header";
+        ret = avformat_write_header(format, NULL);
+        if (ret >= 0) {
+            header_written = 1;
+            break;
+        }
+        avformat_free_context(format);
+        format = NULL;
+        if (ret != AVERROR(EADDRINUSE))
+            goto end;
+    }
+    if (!header_written)
+        goto end;
+
+    snprintf(tcp_url, sizeof(tcp_url), "tcp://127.0.0.1:%d", port);
+    stage = "set receiver timeout";
+    ret = av_dict_set_int(&options, "rw_timeout", 2000000, 0);
+    if (ret < 0)
+        goto end;
+    ret = ffurl_open_whitelist(&client, tcp_url, AVIO_FLAG_READ_WRITE, NULL,
+                               &options, NULL, NULL, NULL);
+    av_dict_free(&options);
+    if (ret < 0)
+        goto end;
+    stage = "send subscription";
+    static const char subscribe[] = "<OMTSubscribe Video=\"true\" />";
+    memset(header, 0, sizeof(header));
+    header[0] = 1;
+    header[1] = 1;
+    AV_WL32(header + 12, sizeof(subscribe) - 1);
+    ret = write_all(client, header, sizeof(header));
+    if (ret >= 0)
+        ret = write_all(client, (const uint8_t *)subscribe, sizeof(subscribe) - 1);
+    if (ret < 0)
+        goto end;
+    av_usleep(100000);
+
+    packet = av_packet_alloc();
+    stage = "allocate test packet";
+    if (!packet) {
+        ret = AVERROR(ENOMEM);
+        goto end;
+    }
+    ret = av_new_packet(packet, test->expected_size);
+    if (ret < 0)
+        goto end;
+    memcpy(packet->data, test->expected_data, test->expected_size);
+    packet->stream_index = 0;
+    stage = "write test packet";
+    packet->pts = packet->dts = 123;
+    ret = av_write_frame(format, packet);
+    if (ret < 0)
+        goto end;
+
+    stage = "read OMT frame header";
+    ret = ffurl_read_complete(client, header, sizeof(header));
+    if (ret < 0 || ret != sizeof(header)) {
+        ret = ret < 0 ? ret : AVERROR_EOF;
+        goto end;
+    }
+    size = AV_RL32(header + 12);
+    if (header[0] != 1 || header[1] != 2 || AV_RL64(header + 2) != 41000000 ||
+        AV_RL16(header + 10) || size != sizeof(extended) + test->wire_size) {
+        av_log(NULL, AV_LOG_ERROR,
+               "OMT mux frame header differs: version=%u type=%u pts=%"PRId64" size=%u\n",
+               header[0], header[1], AV_RL64(header + 2), size);
+        ret = AVERROR_INVALIDDATA;
+        goto end;
+    }
+    stage = "read OMT video extension";
+    ret = ffurl_read_complete(client, extended, sizeof(extended));
+    if (ret < 0 || ret != sizeof(extended)) {
+        ret = ret < 0 ? ret : AVERROR_EOF;
+        goto end;
+    }
+    if (AV_RL32(extended) != test->codec || AV_RL32(extended + 4) != 2 ||
+        AV_RL32(extended + 8) != 2 || AV_RL32(extended + 24) != test->flags) {
+        av_log(NULL, AV_LOG_ERROR,
+               "OMT mux video header differs: codec=%08x flags=%u\n",
+               AV_RL32(extended), AV_RL32(extended + 24));
+        ret = AVERROR_INVALIDDATA;
+        goto end;
+    }
+    stage = "read OMT media payload";
+    ret = ffurl_read_complete(client, wire_data, test->wire_size);
+    if (ret < 0 || ret != test->wire_size) {
+        ret = ret < 0 ? ret : AVERROR_EOF;
+        goto end;
+    }
+    if (memcmp(wire_data, test->wire_data, test->wire_size)) {
+        av_log(NULL, AV_LOG_ERROR, "OMT mux payload differs for codec %08x\n",
+               test->codec);
+        ret = AVERROR_INVALIDDATA;
+    } else
+        ret = 0;
+
+end:
+    if (ret < 0)
+        av_log(NULL, AV_LOG_ERROR, "OMT mux test failed during %s: %s\n",
+               stage, av_err2str(ret));
+    av_dict_free(&options);
+    av_packet_free(&packet);
+    ffurl_closep(&client);
+    if (format) {
+        if (header_written) {
+            int trailer_ret = av_write_trailer(format);
+            if (ret >= 0 && trailer_ret < 0)
+                ret = trailer_ret;
+        }
+        avformat_free_context(format);
+    }
+    return ret;
+}
+
 int main(void)
 {
     static const uint8_t bgrx[] = {
@@ -204,6 +358,8 @@ int main(void)
         return 1;
     for (unsigned i = 0; i < FF_ARRAY_ELEMS(tests); i++) {
         ret = omt_test_one(&tests[i]);
+        if (ret >= 0)
+            ret = omt_test_mux_one(&tests[i]);
         if (ret < 0) {
             av_log(NULL, AV_LOG_ERROR, "OMT API test %u failed: %s\n",
                    i, av_err2str(ret));
