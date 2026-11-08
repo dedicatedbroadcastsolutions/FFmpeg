@@ -1086,8 +1086,9 @@ and P216 video, 8-bit or 10-bit progressive VMX1 video through the @code{vmix}
 decoder, and FPA1 planar floating-point audio. The muxer supports up to 64 receiver
 channel connections and queues up to eight frames per receiver. Receivers that
 cannot keep up are disconnected.
-DNS-SD requires a build configured with @code{--enable-libdns_sd}. Interlaced
-and preview video and OMT alpha formats other than BGRA, UYVA, and PA16 are not
+DNS-SD is implemented natively using IPv4 multicast DNS. IPv6 DNS-SD is not
+advertised yet. Interlaced and
+preview video and OMT alpha formats other than BGRA, UYVA, and PA16 are not
 supported yet.
 
 @section rawvideo

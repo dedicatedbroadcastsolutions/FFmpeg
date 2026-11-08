@@ -3381,8 +3381,7 @@ causes the server to remove the source.
 
 @item source_name
 Name to advertise through discovery. When @option{discovery_server} is unset,
-the sender uses DNS-SD and requires a build configured with
-@code{--enable-libdns_sd}.
+the sender uses native IPv4 multicast DNS. IPv6 DNS-SD is not advertised yet.
 
 @item listen_timeout
 Maximum time in milliseconds to wait for each receiver connection. Default is

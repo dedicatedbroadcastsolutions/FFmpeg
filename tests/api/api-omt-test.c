@@ -29,6 +29,7 @@
 
 #include "libavcodec/avcodec.h"
 #include "libavformat/avformat.h"
+#include "libavformat/omtdns.h"
 #include "libavformat/url.h"
 
 typedef struct OMTTestCase {
@@ -1289,6 +1290,8 @@ int main(void)
         ret = omt_test_discovery_register();
     if (ret >= 0)
         ret = omt_test_discovery_resolve();
+    if (ret >= 0)
+        ret = ff_omt_dns_sd_test();
     vmix_p216_size = av_base64_decode(vmix_p216_packet, vmix_p216_packet_base64,
                                       sizeof(vmix_p216_packet));
     if (ret >= 0 && vmix_p216_size != 689)

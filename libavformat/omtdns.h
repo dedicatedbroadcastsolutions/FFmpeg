@@ -33,5 +33,6 @@ void ff_omt_dns_sd_unregister(OMTDNSService **service);
 int ff_omt_dns_sd_resolve(const char *name, char *host, size_t host_size,
                           int *port, AVIOInterruptCB *interrupt_callback,
                           int64_t timeout, void *log_ctx);
+int ff_omt_dns_sd_test(void);
 
 #endif

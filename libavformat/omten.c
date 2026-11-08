@@ -202,7 +202,6 @@ static int omt_open_discovery(AVFormatContext *ctx, OMTMuxContext *s)
     memcpy(source_name, s->source_name, source_len);
     source_name[source_len] = 0;
     if (!s->discovery_server) {
-#if CONFIG_LIBDNS_SD
         AVBPrint name;
         char *full_name = NULL;
 
@@ -218,11 +217,6 @@ static int omt_open_discovery(AVFormatContext *ctx, OMTMuxContext *s)
                                          s->listener_port, ctx);
         av_free(full_name);
         return ret;
-#else
-        av_log(ctx, AV_LOG_ERROR,
-               "DNS-SD is unavailable; configure with --enable-libdns_sd\n");
-        return AVERROR(ENOSYS);
-#endif
     }
 
     av_url_split(protocol, sizeof(protocol), authorization, sizeof(authorization),
@@ -844,9 +838,7 @@ static int omt_write_packet(AVFormatContext *ctx, AVPacket *pkt)
 static void omt_close(AVFormatContext *ctx)
 {
     OMTMuxContext *s = ctx->priv_data;
-#if CONFIG_LIBDNS_SD
     ff_omt_dns_sd_unregister(&s->dns_sd);
-#endif
     if (s->discovery_thread_started) {
         atomic_store(&s->discovery_exiting, 1);
         pthread_join(s->discovery_thread, NULL);
