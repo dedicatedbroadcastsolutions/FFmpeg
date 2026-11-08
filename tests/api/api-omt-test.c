@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "libavutil/base64.h"
 #include "libavutil/intfloat.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/random_seed.h"
@@ -64,6 +65,8 @@ static void *omt_test_server(void *arg)
     OMTTestServer *server = arg;
     URLContext *client = NULL;
     uint8_t header[16], extended[32], message[128];
+    int width = server->test->codec == MKTAG('V', 'M', 'X', '1') ? 32 : 2;
+    int height = width;
     int ret;
 
     ret = ffurl_accept(server->listener, &client);
@@ -89,8 +92,8 @@ static void *omt_test_server(void *arg)
 
     memset(extended, 0, sizeof(extended));
     AV_WL32(extended, server->test->codec);
-    AV_WL32(extended + 4, 2);
-    AV_WL32(extended + 8, 2);
+    AV_WL32(extended + 4, width);
+    AV_WL32(extended + 8, height);
     AV_WL32(extended + 12, 30);
     AV_WL32(extended + 16, 1);
     AV_WL32(extended + 20, av_float2int(1.0f));
@@ -121,6 +124,8 @@ static int omt_test_one(const OMTTestCase *test)
     AVPacket *packet = NULL;
     pthread_t thread;
     char listen_url[128], input_url[128];
+    enum AVCodecID codec_id = test->codec == MKTAG('V', 'M', 'X', '1') ?
+                              AV_CODEC_ID_VMIX : AV_CODEC_ID_RAWVIDEO;
     int port = -1, ret = AVERROR(EADDRINUSE);
 
     for (int i = 0; i < 128; i++) {
@@ -155,6 +160,7 @@ static int omt_test_one(const OMTTestCase *test)
     if (ret < 0)
         goto end;
     if (format->nb_streams != 1 ||
+        format->streams[0]->codecpar->codec_id != codec_id ||
         format->streams[0]->codecpar->format != test->pixel_format ||
         packet->size != test->expected_size ||
         memcmp(packet->data, test->expected_data, test->expected_size))
@@ -178,7 +184,11 @@ static int omt_test_mux_one(const OMTTestCase *test)
     AVDictionary *options = NULL;
     AVStream *stream;
     char output_url[128], tcp_url[128];
-    uint8_t header[16], extended[32], wire_data[128];
+    uint8_t header[16], extended[32], wire_data[1024];
+    int width = test->codec == MKTAG('V', 'M', 'X', '1') ? 32 : 2;
+    int height = width;
+    enum AVCodecID codec_id = test->codec == MKTAG('V', 'M', 'X', '1') ?
+                              AV_CODEC_ID_VMIX : AV_CODEC_ID_RAWVIDEO;
     uint32_t size;
     int port = -1, ret = AVERROR(EADDRINUSE), header_written = 0;
     const char *stage = "allocate output";
@@ -198,12 +208,13 @@ static int omt_test_mux_one(const OMTTestCase *test)
             goto end;
         }
         stream->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
-        stream->codecpar->codec_id = AV_CODEC_ID_RAWVIDEO;
+        stream->codecpar->codec_id = codec_id;
         stream->codecpar->format = test->pixel_format;
-        stream->codecpar->width = 2;
-        stream->codecpar->height = 2;
+        stream->codecpar->width = width;
+        stream->codecpar->height = height;
         stream->codecpar->bits_per_raw_sample =
-            test->pixel_format == AV_PIX_FMT_YUVA422P10LE ? 10 : 8;
+            test->pixel_format == AV_PIX_FMT_YUVA422P10LE || codec_id == AV_CODEC_ID_VMIX ?
+            10 : 8;
         stream->time_base = (AVRational){ 1, 30 };
         stream->r_frame_rate = (AVRational){ 30, 1 };
         stream->avg_frame_rate = (AVRational){ 30, 1 };
@@ -283,8 +294,8 @@ static int omt_test_mux_one(const OMTTestCase *test)
         ret = ret < 0 ? ret : AVERROR_EOF;
         goto end;
     }
-    if (AV_RL32(extended) != test->codec || AV_RL32(extended + 4) != 2 ||
-        AV_RL32(extended + 8) != 2 || AV_RL32(extended + 24) != test->flags) {
+    if (AV_RL32(extended) != test->codec || AV_RL32(extended + 4) != width ||
+        AV_RL32(extended + 8) != height || AV_RL32(extended + 24) != test->flags) {
         av_log(NULL, AV_LOG_ERROR,
                "OMT mux video header differs: codec=%08x flags=%u\n",
                AV_RL32(extended), AV_RL32(extended + 24));
@@ -324,6 +335,19 @@ end:
 
 int main(void)
 {
+    static const char vmix_p216_packet_base64[] =
+        "AwMBUAIWAAAAA7AdQOoCIBCBvAVgJgHuJFmAAfbYsBYAAAADuAuhQHUD0EwOoLwAgowgXACBjCB8LgEA"
+        "AMcOtUoNxw61Sg3HDrVKDcE4JcbsJBJ0a0JEqQ8rIRymlbkLaVEt44dapQbihRDEZStERE223pJK223S"
+        "SUjcJB8EpwuVihzKYYtptbIUXtabLaebVojt2yypY4dapQbAxCISkKIRaPrQwUzl0t2zi9Ciq1RSKm9N"
+        "UpRb02QTreJ3kFnOL1tNp44UliG06TVESelbVictHIelshCpDRKImiap4SEaTpkaWR02t26VLOyCcyPk"
+        "SI9mMQYISWm3iS7GkS0227b2rUjFEyZEbJshWRocOy7meUbszS1SZi09yNSvNSRchWY7IsaJOPKlT2mK"
+        "EUUzellptJrT3SsTko5D09FIVIaJZWmXVPCQjbVIrSyOknu1Sou8hSrOQhGZpmSCAqRKxJXi0qbpFTTL"
+        "apaoQgEAANEEDhBRIkqMYi2UrkUY23aSVNukogMgjFh/YgixAzLtEkKdLWsS9tW6aIqSdvek6HDrVKDc"
+        "cOtUoNwuGxYIyk2TECCWQQntb1TKV6WVyqktKkpG3jh1qlBuOHWqUG4TCIoEArOemV0jGVlO4xJSFLIp"
+        "m2lgzEKyLFJvKZrIMGZluRNnFrORvetm3rW9bnIcpGyitlMyIrKcKnJrdNFJtES3tIpGt7txZsTiGzFZ"
+        "GQWJEhMpG7aRDaKa1Rdq3pUogpiEbKL0Q7IispgoYu900UmmVvW0ikT1u1KAkZHkRURG22MEYoyZG3RR"
+        "Il4slpZWSiZJE6cjMytpCGUpt7o4TEt6aWhK0I3pJIh7WqdJyEYgpRBS4or01s5xIVelrS2ISZktuk7e"
+        "6Vp2RiSEEFLiyLbWznEBRbetLYhNHb06TtapW3Q=";
     static const uint8_t uyvy[] = {
         128, 16, 128, 64, 129, 32, 129, 80,
     };
@@ -387,6 +411,8 @@ int main(void)
         { MKTAG('P', 'A', '1', '6'), 18, AV_PIX_FMT_YUVA422P10LE,
           pa16_wire, sizeof(pa16_wire), pa16_planar, sizeof(pa16_planar) },
     };
+    uint8_t vmix_p216_packet[1024];
+    int vmix_p216_size;
     int ret = avformat_network_init();
 
     if (ret < 0)
@@ -400,6 +426,23 @@ int main(void)
                    i, av_err2str(ret));
             break;
         }
+    }
+    vmix_p216_size = av_base64_decode(vmix_p216_packet, vmix_p216_packet_base64,
+                                      sizeof(vmix_p216_packet));
+    if (ret >= 0 && vmix_p216_size != 689)
+        ret = AVERROR_INVALIDDATA;
+    if (ret >= 0) {
+        OMTTestCase vmix_test = {
+            MKTAG('V', 'M', 'X', '1'), 16, AV_PIX_FMT_YUV422P10LE,
+            vmix_p216_packet, vmix_p216_size,
+            vmix_p216_packet, vmix_p216_size,
+        };
+        ret = omt_test_one(&vmix_test);
+        if (ret >= 0)
+            ret = omt_test_mux_one(&vmix_test);
+        if (ret < 0)
+            av_log(NULL, AV_LOG_ERROR, "OMT API 10-bit VMX1 test failed: %s\n",
+                   av_err2str(ret));
     }
     avformat_network_deinit();
     return ret < 0;

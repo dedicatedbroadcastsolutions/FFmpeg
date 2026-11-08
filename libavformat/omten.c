@@ -425,11 +425,15 @@ static int omt_video_header(AVFormatContext *ctx, AVStream *st,
     float aspect;
 
     if (par->codec_id == AV_CODEC_ID_VMIX) {
-        if (par->bits_per_raw_sample > 8) {
-            av_log(ctx, AV_LOG_ERROR, "High-bit-depth VMX1 output is not supported yet\n");
+        if (par->bits_per_raw_sample > 10 ||
+            (par->bits_per_raw_sample > 8 && par->bits_per_raw_sample != 10)) {
+            av_log(ctx, AV_LOG_ERROR, "Unsupported VMX1 bit depth %d\n",
+                   par->bits_per_raw_sample);
             return AVERROR_PATCHWELCOME;
         }
         codec = MKTAG('V', 'M', 'X', '1');
+        if (par->bits_per_raw_sample == 10)
+            flags |= 16;
     } else if (par->codec_id == AV_CODEC_ID_RAWVIDEO) {
         switch (pix_fmt) {
         case AV_PIX_FMT_UYVY422: codec = MKTAG('U', 'Y', 'V', 'Y'); break;

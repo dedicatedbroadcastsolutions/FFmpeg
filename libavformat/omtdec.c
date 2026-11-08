@@ -256,9 +256,9 @@ static int omt_add_video_stream(AVFormatContext *ctx, const uint8_t *header)
         (codec == MKTAG('Y', 'V', '1', '2') && ((width | height) & 1)))
         return AVERROR_INVALIDDATA;
     if (codec == MKTAG('V', 'M', 'X', '1')) {
-        if (flags & (1 | 2 | 8 | 16)) {
+        if (flags & ~16U) {
             av_log(ctx, AV_LOG_ERROR,
-                   "OMT VMX1 interlaced, alpha, preview, and high-bit-depth streams are not supported yet\n");
+                   "OMT VMX1 interlaced, alpha, and preview streams are not supported yet\n");
             return AVERROR_PATCHWELCOME;
         }
         st = avformat_new_stream(ctx, NULL);
@@ -267,8 +267,8 @@ static int omt_add_video_stream(AVFormatContext *ctx, const uint8_t *header)
         st->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
         st->codecpar->codec_id = AV_CODEC_ID_VMIX;
         st->codecpar->codec_tag = codec;
-        st->codecpar->format = AV_PIX_FMT_YUV422P;
-        st->codecpar->bits_per_raw_sample = 8;
+        st->codecpar->format = flags & 16 ? AV_PIX_FMT_YUV422P10LE : AV_PIX_FMT_YUV422P;
+        st->codecpar->bits_per_raw_sample = flags & 16 ? 10 : 8;
     } else {
         enum AVPixelFormat pix_fmt = omt_pixel_format(codec);
         int expected_size;

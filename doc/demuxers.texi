@@ -1072,13 +1072,13 @@ The default value of 0 disables the timeout.
 @end table
 
 The demuxer and muxer support raw UYVY, YUY2, BGRA, BGRX, UYVA, PA16, NV12, YV12,
-and P216 video, 8-bit progressive VMX1 video through the @code{vmix} decoder,
-and FPA1 planar floating-point audio. The muxer supports up to 64 receiver
+and P216 video, 8-bit or 10-bit progressive VMX1 video through the @code{vmix}
+decoder, and FPA1 planar floating-point audio. The muxer supports up to 64 receiver
 channel connections and queues up to eight frames per receiver. Receivers that
 cannot keep up are disconnected.
 DNS-SD and discovery server integration are not implemented. Interlaced and
-preview video, OMT alpha formats other than BGRA, UYVA, and PA16, and
-high-bit-depth VMX1 are not supported yet.
+preview video and OMT alpha formats other than BGRA, UYVA, and PA16 are not
+supported yet.
 
 @section rawvideo
 

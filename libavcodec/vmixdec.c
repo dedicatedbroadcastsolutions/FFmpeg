@@ -83,8 +83,10 @@ static av_cold int decode_init(AVCodecContext *avctx)
 {
     VMIXContext *s = avctx->priv_data;
 
-    avctx->bits_per_raw_sample = 8;
-    avctx->pix_fmt = AV_PIX_FMT_YUV422P;
+    if (avctx->bits_per_raw_sample != 10)
+        avctx->bits_per_raw_sample = 8;
+    avctx->pix_fmt = avctx->bits_per_raw_sample == 10 ?
+                     AV_PIX_FMT_YUV422P10LE : AV_PIX_FMT_YUV422P;
 
     avctx->coded_width = FFALIGN(avctx->width, 16);
     avctx->coded_height = FFALIGN(avctx->height, 16);
@@ -114,7 +116,8 @@ static int decode_dcac(AVCodecContext *avctx,
     VMIXContext *s = avctx->priv_data;
     const int16_t *factors = s->factors;
     const uint8_t *scan = s->scan;
-    const int add = plane ? 0 : 1024;
+    const int ten_bit = avctx->bits_per_raw_sample == 10;
+    const int add = plane ? 0 : (ten_bit ? 512 : 1024);
     int i, dc_v = 0, ac_v = 0, dc = 0;
     const int lshift = s->lshift;
 
@@ -143,13 +146,25 @@ static int decode_dcac(AVCodecContext *avctx,
                     return AVERROR_INVALIDDATA;
                 ac_v = get_se_golomb_vmix(ac_gb);
                 i = scan[n];
-                block[i] = ((unsigned)ac_v * factors[i]) >> 4;
+                block[i] = ((unsigned)ac_v * factors[i]) >> (ten_bit ? 2 : 4);
                 if (!ac_v)
                     ac_run = get_ue_golomb_long(ac_gb);
             }
 
-            block[0] = ((unsigned)dc << lshift) + (unsigned)add;
-            s->idsp.idct_put(dst + x, linesize, block);
+            if (ten_bit) {
+                int shift = lshift + 2;
+                block[0] = shift < 16 ? (int16_t)((uint32_t)dc << shift) : 0;
+                s->idsp.idct(block);
+                for (int row = 0; row < 8; row++) {
+                    uint8_t *dst_row = dst + row * linesize + x * 2;
+                    for (int col = 0; col < 8; col++)
+                        AV_WL16(dst_row + col * 2,
+                                av_clip_uintp2(block[row * 8 + col] + add, 10));
+                }
+            } else {
+                block[0] = ((unsigned)dc << lshift) + (unsigned)add;
+                s->idsp.idct_put(dst + x, linesize, block);
+            }
         }
 
         dst += 8 * linesize;

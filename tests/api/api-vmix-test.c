@@ -18,6 +18,8 @@
 
 #include <string.h>
 
+#include "libavutil/base64.h"
+#include "libavutil/intreadwrite.h"
 #include "libavutil/log.h"
 #include "libavutil/mem.h"
 
@@ -39,6 +41,20 @@ static const uint8_t vmix_packet[] = {
     0xd1, 0x12, 0x5b, 0x70, 0x72, 0x99, 0x6d, 0xc1,
     0xb8,
 };
+
+static const char vmix_p216_packet_base64[] =
+    "AwMBUAIWAAAAA7AdQOoCIBCBvAVgJgHuJFmAAfbYsBYAAAADuAuhQHUD0EwOoLwAgowgXACBjCB8LgEA"
+    "AMcOtUoNxw61Sg3HDrVKDcE4JcbsJBJ0a0JEqQ8rIRymlbkLaVEt44dapQbihRDEZStERE223pJK223S"
+    "SUjcJB8EpwuVihzKYYtptbIUXtabLaebVojt2yypY4dapQbAxCISkKIRaPrQwUzl0t2zi9Ciq1RSKm9N"
+    "UpRb02QTreJ3kFnOL1tNp44UliG06TVESelbVictHIelshCpDRKImiap4SEaTpkaWR02t26VLOyCcyPk"
+    "SI9mMQYISWm3iS7GkS0227b2rUjFEyZEbJshWRocOy7meUbszS1SZi09yNSvNSRchWY7IsaJOPKlT2mK"
+    "EUUzellptJrT3SsTko5D09FIVIaJZWmXVPCQjbVIrSyOknu1Sou8hSrOQhGZpmSCAqRKxJXi0qbpFTTL"
+    "apaoQgEAANEEDhBRIkqMYi2UrkUY23aSVNukogMgjFh/YgixAzLtEkKdLWsS9tW6aIqSdvek6HDrVKDc"
+    "cOtUoNwuGxYIyk2TECCWQQntb1TKV6WVyqktKkpG3jh1qlBuOHWqUG4TCIoEArOemV0jGVlO4xJSFLIp"
+    "m2lgzEKyLFJvKZrIMGZluRNnFrORvetm3rW9bnIcpGyitlMyIrKcKnJrdNFJtES3tIpGt7txZsTiGzFZ"
+    "GQWJEhMpG7aRDaKa1Rdq3pUogpiEbKL0Q7IispgoYu900UmmVvW0ikT1u1KAkZHkRURG22MEYoyZG3RR"
+    "Il4slpZWSiZJE6cjMytpCGUpt7o4TEt6aWhK0I3pJIh7WqdJyEYgpRBS4or01s5xIVelrS2ISZktuk7e"
+    "6Vp2RiSEEFLiyLbWznEBRbetLYhNHb06TtapW3Q=";
 
 static const uint8_t reference_uyvy[] = {
     0x64, 0x18, 0x75, 0x33, 0x67, 0x27, 0x74, 0x3e, 0x6c, 0x36, 0x73, 0x4e,
@@ -86,7 +102,7 @@ static const uint8_t reference_uyvy[] = {
     0x93, 0xd1, 0x88, 0x5a, 0x96, 0xd0, 0x89, 0x7a,
 };
 
-static int open_decoder(AVCodecContext **decoder)
+static int open_decoder(AVCodecContext **decoder, int width, int height, int bit_depth)
 {
     const AVCodec *codec = avcodec_find_decoder(AV_CODEC_ID_VMIX);
 
@@ -95,9 +111,71 @@ static int open_decoder(AVCodecContext **decoder)
     *decoder = avcodec_alloc_context3(codec);
     if (!*decoder)
         return AVERROR(ENOMEM);
-    (*decoder)->width  = 16;
-    (*decoder)->height = 16;
+    (*decoder)->width  = width;
+    (*decoder)->height = height;
+    (*decoder)->bits_per_raw_sample = bit_depth;
     return avcodec_open2(*decoder, codec, NULL);
+}
+
+static uint32_t hash_10bit_frame(const AVFrame *frame)
+{
+    uint32_t hash = 2166136261U;
+
+    for (int plane = 0; plane < 3; plane++) {
+        int width = plane ? frame->width / 2 : frame->width;
+        for (int y = 0; y < frame->height; y++) {
+            const uint8_t *row = frame->data[plane] + y * frame->linesize[plane];
+            for (int x = 0; x < width; x++) {
+                uint16_t sample = AV_RL16(row + x * 2);
+                hash = (hash ^ (sample & 0xff)) * 16777619U;
+                hash = (hash ^ (sample >> 8)) * 16777619U;
+            }
+        }
+    }
+    return hash;
+}
+
+static int test_p216(void)
+{
+    uint8_t packet_data[1024];
+    AVCodecContext *decoder = NULL;
+    AVPacket *packet = NULL;
+    AVFrame *frame = NULL;
+    int packet_size, ret;
+
+    packet_size = av_base64_decode(packet_data, vmix_p216_packet_base64,
+                                   sizeof(packet_data));
+    if (packet_size != 689)
+        return AVERROR_INVALIDDATA;
+    ret = open_decoder(&decoder, 32, 32, 10);
+    if (ret < 0)
+        goto end;
+    packet = av_packet_alloc();
+    frame = av_frame_alloc();
+    if (!packet || !frame) {
+        ret = AVERROR(ENOMEM);
+        goto end;
+    }
+    if ((ret = av_new_packet(packet, packet_size)) < 0)
+        goto end;
+    memcpy(packet->data, packet_data, packet_size);
+    if ((ret = avcodec_send_packet(decoder, packet)) < 0 ||
+        (ret = avcodec_receive_frame(decoder, frame)) < 0)
+        goto end;
+    if (frame->width != 32 || frame->height != 32 ||
+        frame->format != AV_PIX_FMT_YUV422P10LE ||
+        hash_10bit_frame(frame) != 0x55b29440) {
+        av_log(NULL, AV_LOG_ERROR,
+               "VMIX P216 output changed (format=%d hash=%08x)\n",
+               frame->format, hash_10bit_frame(frame));
+        ret = AVERROR_INVALIDDATA;
+    }
+
+end:
+    av_frame_free(&frame);
+    av_packet_free(&packet);
+    avcodec_free_context(&decoder);
+    return ret;
 }
 
 int main(void)
@@ -110,7 +188,7 @@ int main(void)
     uint64_t squared_error = 0;
     int max_error = 0;
 
-    if ((ret = open_decoder(&decoder)) < 0)
+    if ((ret = open_decoder(&decoder, 16, 16, 8)) < 0)
         goto end;
     packet = av_packet_alloc();
     frame = av_frame_alloc();
@@ -159,7 +237,7 @@ int main(void)
     }
 
     avcodec_free_context(&decoder);
-    if ((ret = open_decoder(&decoder)) < 0)
+    if ((ret = open_decoder(&decoder, 16, 16, 8)) < 0)
         goto end;
     packet->data[0] = 0;
     ret = avcodec_send_packet(decoder, packet);
@@ -169,6 +247,8 @@ int main(void)
         ret = AVERROR_INVALIDDATA;
     else
         ret = 0;
+    if (ret >= 0)
+        ret = test_p216();
 
 end:
     av_frame_free(&frame);
