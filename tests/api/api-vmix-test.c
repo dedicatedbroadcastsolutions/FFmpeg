@@ -178,6 +178,102 @@ end:
     return ret;
 }
 
+static int test_encode_roundtrip(void)
+{
+    const AVCodec *encoder = avcodec_find_encoder(AV_CODEC_ID_VMIX);
+    AVCodecContext *encoder_ctx = NULL, *decoder_ctx = NULL;
+    AVFrame *source = NULL, *decoded = NULL;
+    AVPacket *packet = NULL;
+    int ret;
+
+    if (!encoder)
+        return AVERROR_ENCODER_NOT_FOUND;
+    encoder_ctx = avcodec_alloc_context3(encoder);
+    source = av_frame_alloc();
+    decoded = av_frame_alloc();
+    packet = av_packet_alloc();
+    if (!encoder_ctx || !source || !decoded || !packet) {
+        ret = AVERROR(ENOMEM);
+        goto end;
+    }
+    encoder_ctx->width = 16;
+    encoder_ctx->height = 16;
+    encoder_ctx->pix_fmt = AV_PIX_FMT_YUV422P;
+    encoder_ctx->time_base = (AVRational){ 1, 25 };
+    source->format = AV_PIX_FMT_YUV422P;
+    source->width = 16;
+    source->height = 16;
+    if ((ret = avcodec_open2(encoder_ctx, encoder, NULL)) < 0 ||
+        (ret = av_frame_get_buffer(source, 32)) < 0 ||
+        (ret = open_decoder(&decoder_ctx, 16, 16, 8)) < 0)
+        goto end;
+    for (int pattern = 0; pattern < 2; pattern++) {
+        int max_error = 0;
+        int error_plane = 0, error_x = 0, error_y = 0;
+        int source_sample = 0, decoded_sample = 0;
+
+        av_frame_unref(decoded);
+        av_packet_unref(packet);
+        if ((ret = av_frame_make_writable(source)) < 0)
+            goto end;
+        source->pts = pattern;
+        for (int plane = 0; plane < 3; plane++) {
+            int width = plane ? 8 : 16;
+            for (int y = 0; y < 16; y++) {
+                uint8_t *row = source->data[plane] + y * source->linesize[plane];
+                for (int x = 0; x < width; x++)
+                    row[x] = pattern ?
+                             (plane ? 96 + (x * 3 + y * 5 + plane * 17) % 64 :
+                                      16 + (x * 7 + y * 5) % 220) :
+                             (plane ? 128 : 80);
+            }
+        }
+        if ((ret = avcodec_send_frame(encoder_ctx, source)) < 0 ||
+            (ret = avcodec_receive_packet(encoder_ctx, packet)) < 0 ||
+            (ret = avcodec_send_packet(decoder_ctx, packet)) < 0 ||
+            (ret = avcodec_receive_frame(decoder_ctx, decoded)) < 0)
+            goto end;
+        if (decoded->format != AV_PIX_FMT_YUV422P) {
+            ret = AVERROR_INVALIDDATA;
+            goto end;
+        }
+        for (int plane = 0; plane < 3; plane++) {
+            int width = plane ? 8 : 16;
+            for (int y = 0; y < 16; y++) {
+                const uint8_t *src = source->data[plane] + y * source->linesize[plane];
+                const uint8_t *dst = decoded->data[plane] + y * decoded->linesize[plane];
+                for (int x = 0; x < width; x++) {
+                    int error = FFABS(src[x] - dst[x]);
+                    if (error > max_error) {
+                        max_error = error;
+                        error_plane = plane;
+                        error_x = x;
+                        error_y = y;
+                        source_sample = src[x];
+                        decoded_sample = dst[x];
+                    }
+                }
+            }
+        }
+        if (max_error > 64) {
+            av_log(NULL, AV_LOG_ERROR,
+                   "VMIX encoder roundtrip %d max error %d at plane %d (%d,%d): %d vs %d\n",
+                   pattern, max_error, error_plane, error_x, error_y,
+                   source_sample, decoded_sample);
+            ret = AVERROR_INVALIDDATA;
+            goto end;
+        }
+    }
+
+end:
+    av_packet_free(&packet);
+    av_frame_free(&decoded);
+    av_frame_free(&source);
+    avcodec_free_context(&decoder_ctx);
+    avcodec_free_context(&encoder_ctx);
+    return ret;
+}
+
 int main(void)
 {
     AVCodecContext *decoder = NULL;
@@ -249,6 +345,8 @@ int main(void)
         ret = 0;
     if (ret >= 0)
         ret = test_p216();
+    if (ret >= 0)
+        ret = test_encode_roundtrip();
 
 end:
     av_frame_free(&frame);

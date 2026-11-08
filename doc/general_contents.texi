@@ -1265,7 +1265,7 @@ following image formats are supported:
 @item v408 QuickTime uncompressed 4:4:4:4          @tab  X  @tab  X
 @item v410 QuickTime uncompressed 4:4:4 10-bit     @tab  X  @tab  X
 @item VBLE Lossless Codec    @tab     @tab  X
-@item vMix Video             @tab     @tab  X
+@item vMix Video             @tab  X  @tab  X
     @tab fourcc: 'VMX1'
 @item VMware Screen Codec / VMware Video  @tab     @tab  X
     @tab Codec used in videos captured by VMware.

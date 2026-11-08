@@ -7,7 +7,7 @@ fate-api-flac: $(APITESTSDIR)/api-flac-test$(EXESUF)
 fate-api-flac: CMD = run $(APITESTSDIR)/api-flac-test$(EXESUF)
 fate-api-flac: CMP = null
 
-FATE_API_LIBAVCODEC-$(CONFIG_VMIX_DECODER) += fate-api-vmix
+FATE_API_LIBAVCODEC-$(call ALLYES, VMIX_ENCODER VMIX_DECODER) += fate-api-vmix
 fate-api-vmix: $(APITESTSDIR)/api-vmix-test$(EXESUF)
 fate-api-vmix: CMD = run $(APITESTSDIR)/api-vmix-test$(EXESUF)
 fate-api-vmix: CMP = null

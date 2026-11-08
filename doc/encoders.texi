@@ -1410,6 +1410,13 @@ disabled
 A description of some of the currently available video encoders
 follows.
 
+@section vmix
+
+The native VMIX encoder produces progressive 8-bit YUV 4:2:2 video in the
+OMT_SQ profile at fixed quality 80. Input dimensions must be multiples of 16,
+with a maximum size of 7680x4080. The encoder currently does not support
+interlaced video, alpha, high bit depth, or configurable quality.
+
 @section a64_multi, a64_multi5
 
 A64 / Commodore 64 multicolor charset encoder. @code{a64_multi5} is extended with 5th color (colram).
