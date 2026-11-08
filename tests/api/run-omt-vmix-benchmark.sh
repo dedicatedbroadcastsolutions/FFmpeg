@@ -85,7 +85,7 @@ if [ "$benchmark_mode" != vmix ]; then
         '# FFmpeg uses one encode/decode thread; libomt uses its automatic thread count.'
     run=1
     while [ "$run" -le "$repeats" ]; do
-        port=$((20000 + ($$ + run * 251) % 29998))
+        port=$((49152 + ($$ + run * 251) % 16381))
         printf '# OMT repeat %s\n' "$run"
         native_result=$(tests/api/api-omt-bench-test --native "$input" "$width" "$height" "$frames" "$port")
         reference_result=$(tests/api/api-omt-bench-test --reference "$input" "$width" "$height" "$frames" "$((port + 1))")
@@ -101,6 +101,17 @@ if [ "$benchmark_mode" != vmix ]; then
             exit 1
         }
         printf '%s\n%s\n' "$native_result" "$reference_result"
+        native_transport=$(tests/api/api-omt-bench-test --native-transport "$input" "$width" "$height" "$frames" "$((port + 2))")
+        reference_transport=$(tests/api/api-omt-bench-test --reference-transport "$input" "$width" "$height" "$frames" "$((port + 3))")
+        native_packet=$(printf '%s\n' "$native_transport" | awk -F, '$3 == "transport" { print $10 ":" $9 }')
+        reference_packet=$(printf '%s\n' "$reference_transport" | awk -F, '$3 == "transport" { print $10 ":" $9 }')
+        if [ -z "$native_packet" ] || [ "$native_packet" != "$reference_packet" ] ||
+           [ "${native_packet%%:*}" != 1 ]; then
+            printf 'OMT transport packet identity/byte-count check failed: FFmpeg=%s libomt=%s\n' \
+                "$native_packet" "$reference_packet" >&2
+            exit 1
+        fi
+        printf '%s\n%s\n' "$native_transport" "$reference_transport"
         run=$((run + 1))
     done
 fi

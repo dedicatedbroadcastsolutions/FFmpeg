@@ -24,7 +24,9 @@ mode does not require Avahi; OMT and all modes require its Linux runtime librari
 
 The benchmark runner first runs both FATE tests. It then builds the optional
 comparison programs and reports raw CSV rows for VMIX encode/decode and OMT
-loopback end-to-end runs. VMIX checks profile/quality headers, decodes each
+loopback end-to-end and transport-only runs. The transport-only case sends the
+same pre-encoded libvmx packet through each OMT path and requires byte-identical
+delivery. VMIX checks profile/quality headers, decodes each
 implementation's packets with both decoders, and reports source-relative PSNR
 and cross-decoder error; it rejects a PSNR delta over 0.1 dB or cross error over
 2 code values. OMT checks received frame counts, decoded dimensions, bytes, and

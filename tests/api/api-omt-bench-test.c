@@ -21,6 +21,7 @@
 #include "libavutil/time.h"
 
 #include "libomt.h"
+#include "vmxcodec.h"
 
 #define DEFAULT_WIDTH 1280
 #define DEFAULT_HEIGHT 720
@@ -40,6 +41,9 @@ typedef struct OMTBenchReceiver {
     atomic_int stop;
     atomic_uint_fast64_t compressed_bytes;
     uint64_t squared_error;
+    int compressed_only;
+    const uint8_t *expected_packet;
+    int expected_packet_size;
 } OMTBenchReceiver;
 
 typedef struct OMTFFmpegReceiver {
@@ -48,6 +52,8 @@ typedef struct OMTFFmpegReceiver {
     int width;
     int height;
     int expected_frames;
+    const uint8_t *expected_packet;
+    int expected_packet_size;
     atomic_int received_frames;
     atomic_int error;
     atomic_int error_code;
@@ -82,6 +88,20 @@ static void *receive_frames(void *opaque)
 
         if (!frame)
             continue;
+        if (state->compressed_only) {
+            if (frame->Type != OMTFrameType_Video || frame->Codec != OMTCodec_VMX1 ||
+                frame->Data || frame->DataLength ||
+                frame->CompressedLength != state->expected_packet_size ||
+                !frame->CompressedData ||
+                memcmp(frame->CompressedData, state->expected_packet,
+                       state->expected_packet_size)) {
+                atomic_store(&state->error, 1);
+                break;
+            }
+            atomic_fetch_add(&state->compressed_bytes, frame->CompressedLength);
+            atomic_fetch_add(&state->received_frames, 1);
+            continue;
+        }
         if (frame->Type != OMTFrameType_Video || frame->Codec != OMTCodec_UYVY ||
             frame->Width != state->width || frame->Height != state->height ||
             frame->DataLength != frame->Width * frame->Height * 2 || !frame->Data ||
@@ -139,6 +159,17 @@ static void *receive_ffmpeg_frames(void *opaque)
             continue;
         }
         state->bytes += packet->size;
+        if (state->expected_packet) {
+            if (packet->size != state->expected_packet_size ||
+                memcmp(packet->data, state->expected_packet, packet->size)) {
+                atomic_store(&state->error_code, AVERROR_INVALIDDATA);
+                atomic_store(&state->error, 1);
+                break;
+            }
+            atomic_fetch_add(&state->received_frames, 1);
+            av_packet_unref(packet);
+            continue;
+        }
         if (!decoder) {
             const AVCodec *codec = avcodec_find_decoder(
                 state->format->streams[packet->stream_index]->codecpar->codec_id);
@@ -471,6 +502,274 @@ end:
     return ret;
 }
 
+static int make_reference_packet(const char *input, int width, int height,
+                                 uint8_t **packet, int *packet_size)
+{
+    VMX_INSTANCE *encoder = NULL;
+    VMX_SIZE dimensions = { width, height };
+    FILE *file = NULL;
+    uint8_t *frame = NULL, *encoded = NULL;
+    int64_t frame_size = (int64_t)width * height * 2;
+    int max_size, ret = AVERROR(EINVAL);
+
+    if (width < 16 || height < 16 || width > 7680 || height > 4320 ||
+        (width & 15) || (height & 15) || frame_size <= 0 ||
+        frame_size > MAX_FRAME_SIZE)
+        return AVERROR(EINVAL);
+    file = fopen(input, "rb");
+    frame = av_malloc(frame_size);
+    max_size = frame_size * 2;
+    encoded = av_malloc(max_size);
+    encoder = VMX_Create(dimensions, VMX_PROFILE_OMT_SQ, VMX_COLORSPACE_UNDEFINED);
+    if (!file || !frame || !encoded || !encoder) {
+        ret = AVERROR(ENOMEM);
+        goto end;
+    }
+    if (fread(frame, 1, frame_size, file) != frame_size) {
+        ret = AVERROR(EIO);
+        goto end;
+    }
+    VMX_SetThreads(encoder, 1);
+    VMX_SetQuality(encoder, 80);
+    if (VMX_EncodeYUY2(encoder, frame, width * 2, 0) != VMX_ERR_OK) {
+        ret = AVERROR_INVALIDDATA;
+        goto end;
+    }
+    *packet_size = VMX_SaveTo(encoder, encoded, max_size);
+    if (*packet_size <= 0) {
+        ret = AVERROR_INVALIDDATA;
+        goto end;
+    }
+    *packet = encoded;
+    encoded = NULL;
+    ret = 0;
+
+end:
+    VMX_Destroy(encoder);
+    av_free(frame);
+    av_free(encoded);
+    if (file)
+        fclose(file);
+    return ret;
+}
+
+static int run_native_transport(const char *input, int width, int height,
+                                int frames, int port)
+{
+    AVFormatContext *output = NULL;
+    AVPacket *packet = NULL;
+    OMTFFmpegReceiver state = { 0 };
+    pthread_t thread;
+    uint8_t *encoded = NULL;
+    int encoded_size = 0, ret, thread_started = 0;
+    int64_t start, elapsed;
+    char url[64];
+
+    if (frames < 1 || frames == INT_MAX || port < 1 || port > 65535)
+        return AVERROR(EINVAL);
+    ret = make_reference_packet(input, width, height, &encoded, &encoded_size);
+    if (ret < 0) {
+        fprintf(stderr, "FFmpeg OMT transport could not prepare reference packet: %s\n",
+                av_err2str(ret));
+        return ret;
+    }
+    state.expected_frames = frames + 1;
+    state.expected_packet = encoded;
+    state.expected_packet_size = encoded_size;
+
+    snprintf(url, sizeof(url), "omt://127.0.0.1:%d", port);
+    ret = avformat_alloc_output_context2(&output, NULL, "omt", url);
+    if (ret < 0 || !output)
+        goto end;
+    AVStream *stream = avformat_new_stream(output, NULL);
+    if (!stream) {
+        ret = AVERROR(ENOMEM);
+        goto end;
+    }
+    stream->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
+    stream->codecpar->codec_id = AV_CODEC_ID_VMIX;
+    stream->codecpar->format = AV_PIX_FMT_YUYV422;
+    stream->codecpar->width = width;
+    stream->codecpar->height = height;
+    stream->codecpar->bits_per_raw_sample = 8;
+    stream->codecpar->framerate = (AVRational){ 60, 1 };
+    stream->time_base = (AVRational){ 1, 60 };
+    stream->avg_frame_rate = stream->r_frame_rate = (AVRational){ 60, 1 };
+    if ((ret = avformat_write_header(output, NULL)) < 0)
+        goto end;
+
+    if ((ret = avformat_open_input(&state.format, url, av_find_input_format("omt"),
+                                   NULL)) < 0)
+        goto end;
+    if (pthread_create(&thread, NULL, receive_ffmpeg_frames, &state)) {
+        ret = AVERROR(errno);
+        goto end;
+    }
+    thread_started = 1;
+    packet = av_packet_alloc();
+    if (!packet || (ret = av_new_packet(packet, encoded_size)) < 0) {
+        ret = AVERROR(ENOMEM);
+        goto end;
+    }
+    memcpy(packet->data, encoded, encoded_size);
+    packet->stream_index = stream->index;
+    packet->pts = packet->dts = 0;
+    if ((ret = av_write_frame(output, packet)) < 0)
+        goto end;
+    int64_t deadline = av_gettime_relative() + 10000000;
+    while (atomic_load(&state.received_frames) < 1 &&
+           !atomic_load(&state.error) && av_gettime_relative() < deadline)
+        av_usleep(1000);
+    if (atomic_load(&state.received_frames) != 1) {
+        ret = AVERROR_INVALIDDATA;
+        goto end;
+    }
+
+    start = av_gettime_relative();
+    for (int i = 0; i < frames; i++) {
+        packet->pts = packet->dts = i + 1;
+        if ((ret = av_write_frame(output, packet)) < 0)
+            goto end;
+    }
+    pthread_join(thread, NULL);
+    thread_started = 0;
+    elapsed = av_gettime_relative() - start;
+    if (atomic_load(&state.error) || atomic_load(&state.received_frames) != frames + 1) {
+        ret = AVERROR_INVALIDDATA;
+        goto end;
+    }
+    printf("omt,ffmpeg,transport,%d,%d,%d,%.6f,%.2f,%" PRIu64 ",1\n",
+           width, height, frames, elapsed / 1000000.0,
+           frames * 1000000.0 / FFMAX(elapsed, 1),
+           (uint64_t)encoded_size * frames);
+    ret = 0;
+
+end:
+    if (thread_started) {
+        avformat_close_input(&state.format);
+        pthread_join(thread, NULL);
+    }
+    if (output)
+        av_write_trailer(output);
+    avformat_free_context(output);
+    av_packet_free(&packet);
+    av_free(encoded);
+    if (ret < 0)
+        fprintf(stderr, "FFmpeg OMT transport failed: %s (%d/%d packets)\n",
+                av_err2str(ret), atomic_load(&state.received_frames), frames + 1);
+    return ret;
+}
+
+static int run_reference_transport(const char *input, int width, int height,
+                                   int frames, int port)
+{
+    omt_send_t *sender = NULL;
+    omt_receive_t *receiver = NULL;
+    pthread_t thread;
+    OMTBenchReceiver state = { .width = width, .height = height,
+                               .compressed_only = 1 };
+    OMTMediaFrame frame = { 0 };
+    uint8_t *encoded = NULL;
+    int encoded_size = 0, ret = 1;
+    int64_t start, elapsed;
+
+    if (frames < 1 || frames == INT_MAX || port < 1 || port > 65535)
+        return 1;
+    int packet_ret = make_reference_packet(input, width, height, &encoded, &encoded_size);
+    if (packet_ret < 0) {
+        fprintf(stderr, "libomt transport could not prepare reference packet: %s\n",
+                av_err2str(packet_ret));
+        return 1;
+    }
+    omt_settings_set_integer("NetworkPortStart", port);
+    omt_settings_set_integer("NetworkPortEnd", port);
+    omt_setloggingcallback(omt_log);
+    sender = omt_send_create("FFmpeg parity transport benchmark", OMTQuality_Medium);
+    if (!sender)
+        goto end;
+    char url[64];
+    snprintf(url, sizeof(url), "omt://127.0.0.1:%d", port);
+    receiver = omt_receive_create(url, OMTFrameType_Video,
+                                  OMTPreferredVideoFormat_UYVY,
+                                  OMTReceiveFlags_CompressedOnly);
+    if (!receiver)
+        goto end;
+
+    state.receiver = receiver;
+    state.expected_frames = frames + 1;
+    state.expected_packet = encoded;
+    state.expected_packet_size = encoded_size;
+    int thread_ret = pthread_create(&thread, NULL, receive_frames, &state);
+    if (thread_ret) {
+        ret = AVERROR(thread_ret);
+        goto end;
+    }
+    int64_t deadline = monotonic_us() + 10000000;
+    while (omt_send_connections(sender) < 1 && monotonic_us() < deadline)
+        nanosleep(&(struct timespec){ .tv_nsec = 10000000 }, NULL);
+    if (omt_send_connections(sender) < 1) {
+        atomic_store(&state.stop, 1);
+        pthread_join(thread, NULL);
+        goto end;
+    }
+
+    frame.Type = OMTFrameType_Video;
+    frame.Codec = OMTCodec_VMX1;
+    frame.Width = width;
+    frame.Height = height;
+    frame.Stride = width * 2;
+    frame.Flags = OMTVideoFlags_None;
+    frame.FrameRateN = 60;
+    frame.FrameRateD = 1;
+    frame.AspectRatio = (float)width / height;
+    frame.Data = encoded;
+    frame.DataLength = encoded_size;
+    frame.Timestamp = 0;
+    if (omt_send(sender, &frame) <= 0) {
+        atomic_store(&state.stop, 1);
+        pthread_join(thread, NULL);
+        goto end;
+    }
+    deadline = monotonic_us() + 10000000;
+    while (atomic_load(&state.received_frames) < 1 &&
+           !atomic_load(&state.error) && monotonic_us() < deadline)
+        nanosleep(&(struct timespec){ .tv_nsec = 1000000 }, NULL);
+    if (atomic_load(&state.received_frames) != 1 || atomic_load(&state.error)) {
+        atomic_store(&state.stop, 1);
+        pthread_join(thread, NULL);
+        goto end;
+    }
+
+    start = monotonic_us();
+    for (int i = 0; i < frames; i++) {
+        frame.Timestamp = (int64_t)(i + 1) * 10000000 / 60;
+        if (omt_send(sender, &frame) <= 0) {
+            atomic_store(&state.stop, 1);
+            break;
+        }
+    }
+    pthread_join(thread, NULL);
+    elapsed = monotonic_us() - start;
+    if (atomic_load(&state.error) || atomic_load(&state.received_frames) != frames + 1)
+        goto end;
+    printf("omt,libomt,transport,%d,%d,%d,%.6f,%.2f,%" PRIuFAST64 ",1\n",
+           width, height, frames, elapsed / 1000000.0,
+           frames * 1000000.0 / (double)(elapsed ? elapsed : 1),
+           (uint_fast64_t)encoded_size * frames);
+    ret = 0;
+
+end:
+    if (ret)
+        fprintf(stderr, "libomt transport failed: exact packet delivery %d/%d\n",
+                atomic_load(&state.received_frames), frames + 1);
+    if (receiver)
+        omt_receive_destroy(receiver);
+    if (sender)
+        omt_send_destroy(sender);
+    av_free(encoded);
+    return ret;
+}
+
 int main(int argc, char **argv)
 {
     const char *input;
@@ -518,15 +817,24 @@ int main(int argc, char **argv)
                 argv[0], argv[0], argv[0], argv[0]);
         return 2;
     }
-    if ((!strcmp(argv[1], "--native") || !strcmp(argv[1], "--reference")) && argc == 7) {
+        if ((!strcmp(argv[1], "--native") || !strcmp(argv[1], "--reference") ||
+            !strcmp(argv[1], "--native-transport") ||
+            !strcmp(argv[1], "--reference-transport")) && argc == 7) {
         input = argv[2];
         width = atoi(argv[3]);
         height = atoi(argv[4]);
         frames = atoi(argv[5]);
         port = atoi(argv[6]);
-        puts("domain,implementation,operation,width,height,frames,seconds,fps,bytes,psnr_db");
+        if (strstr(argv[1], "transport"))
+            puts("domain,implementation,operation,width,height,frames,seconds,fps,bytes,packet_exact");
+        else
+            puts("domain,implementation,operation,width,height,frames,seconds,fps,bytes,psnr_db");
         if (!strcmp(argv[1], "--native"))
             return run_native_benchmark(input, width, height, frames, port) < 0;
+        if (!strcmp(argv[1], "--native-transport"))
+            return run_native_transport(input, width, height, frames, port) < 0;
+        if (!strcmp(argv[1], "--reference-transport"))
+            return run_reference_transport(input, width, height, frames, port);
         return run_benchmark(input, width, height, frames, port);
     }
     input = argv[1];
