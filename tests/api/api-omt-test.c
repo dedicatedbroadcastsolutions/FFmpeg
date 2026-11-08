@@ -54,6 +54,11 @@ typedef struct OMTAudioTestServer {
     int result;
 } OMTAudioTestServer;
 
+typedef struct OMTTimeoutTestServer {
+    URLContext *listener;
+    int result;
+} OMTTimeoutTestServer;
+
 static int write_all(URLContext *url, const uint8_t *data, int size)
 {
     int written = 0;
@@ -168,6 +173,41 @@ static void *omt_audio_test_server(void *arg)
         ret = write_all(client, extended, sizeof(extended));
     if (ret >= 0)
         ret = write_all(client, server->wire_data, server->wire_size);
+
+end:
+    ffurl_closep(&client);
+    server->result = ret;
+    return NULL;
+}
+
+static void *omt_timeout_test_server(void *arg)
+{
+    OMTTimeoutTestServer *server = arg;
+    URLContext *client = NULL;
+    uint8_t header[16], message[128], byte;
+    int ret;
+
+    ret = ffurl_accept(server->listener, &client);
+    if (ret < 0)
+        goto end;
+    for (int i = 0; i < 3; i++) {
+        ret = ffurl_read_complete(client, header, sizeof(header));
+        if (ret < 0 || ret != sizeof(header) || header[0] != 1 || header[1] != 1) {
+            ret = ret < 0 ? ret : AVERROR_INVALIDDATA;
+            goto end;
+        }
+        uint32_t size = AV_RL32(header + 12);
+        if (!size || size > sizeof(message)) {
+            ret = AVERROR_INVALIDDATA;
+            goto end;
+        }
+        ret = ffurl_read_complete(client, message, size);
+        if (ret < 0 || ret != size) {
+            ret = ret < 0 ? ret : AVERROR_EOF;
+            goto end;
+        }
+    }
+    ret = ffurl_read(client, &byte, 1);
 
 end:
     ffurl_closep(&client);
@@ -293,6 +333,74 @@ end:
     ffurl_closep(&server.listener);
     if (ret >= 0 && server.result < 0)
         ret = server.result;
+    return ret;
+}
+
+static int interrupt_after_deadline(void *opaque)
+{
+    int64_t deadline = *(int64_t *)opaque;
+    return av_gettime_relative() >= deadline;
+}
+
+static int omt_test_read_timeout(void)
+{
+    OMTTimeoutTestServer server = { 0 };
+    AVFormatContext *format = avformat_alloc_context();
+    AVDictionary *options = NULL;
+    pthread_t thread;
+    char listen_url[128], input_url[128];
+    int64_t deadline = av_gettime_relative() + 3 * AV_TIME_BASE;
+    int port = -1, ret = AVERROR(EADDRINUSE);
+
+    if (!format)
+        return AVERROR(ENOMEM);
+    format->interrupt_callback.callback = interrupt_after_deadline;
+    format->interrupt_callback.opaque = &deadline;
+    for (int i = 0; i < 128; i++) {
+        port = 49152 + (av_get_random_seed() + i * 6151) % (65536 - 49152);
+        snprintf(listen_url, sizeof(listen_url),
+                 "tcp://127.0.0.1:%d?listen=2&listen_timeout=5000&timeout=5000000",
+                 port);
+        ret = ffurl_open_whitelist(&server.listener, listen_url,
+                                   AVIO_FLAG_READ_WRITE, NULL, NULL,
+                                   NULL, NULL, NULL);
+        if (ret >= 0)
+            break;
+    }
+    if (ret < 0)
+        goto end;
+    ret = pthread_create(&thread, NULL, omt_timeout_test_server, &server);
+    if (ret) {
+        ret = AVERROR(ret);
+        goto end;
+    }
+    ret = av_dict_set_int(&options, "rw_timeout", 100000, 0);
+    if (ret < 0)
+        goto join;
+    snprintf(input_url, sizeof(input_url), "omt://127.0.0.1:%d", port);
+    ret = avformat_open_input(&format, input_url, av_find_input_format("omt"), &options);
+    if (ret >= 0) {
+        AVPacket *packet = av_packet_alloc();
+        if (!packet)
+            ret = AVERROR(ENOMEM);
+        else {
+            ret = av_read_frame(format, packet);
+            av_packet_free(&packet);
+            ret = ret == AVERROR(ETIMEDOUT) ? 0 : AVERROR_INVALIDDATA;
+        }
+    }
+    avformat_close_input(&format);
+join:
+    av_dict_free(&options);
+    pthread_join(thread, NULL);
+    ffurl_closep(&server.listener);
+    if (ret >= 0 && server.result != 0 && server.result != AVERROR_EOF)
+        ret = server.result;
+    return ret;
+
+end:
+    av_dict_free(&options);
+    avformat_free_context(format);
     return ret;
 }
 
@@ -865,6 +973,8 @@ int main(void)
         av_log(NULL, AV_LOG_ERROR, "OMT API audio test failed: %s\n", av_err2str(ret));
     if (ret >= 0)
         ret = omt_test_slow_receiver_isolation();
+    if (ret >= 0)
+        ret = omt_test_read_timeout();
     vmix_p216_size = av_base64_decode(vmix_p216_packet, vmix_p216_packet_base64,
                                       sizeof(vmix_p216_packet));
     if (ret >= 0 && vmix_p216_size != 689)
