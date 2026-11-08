@@ -28,6 +28,7 @@
 #include "libavutil/time.h"
 
 #include "libavcodec/avcodec.h"
+#include "libavcodec/packet.h"
 #include "libavformat/avformat.h"
 #include "libavformat/omtdns.h"
 #include "libavformat/url.h"
@@ -40,6 +41,7 @@ typedef struct OMTTestCase {
     int wire_size;
     const uint8_t *expected_data;
     int expected_size;
+    const char *metadata;
 } OMTTestCase;
 
 typedef struct OMTTestServer {
@@ -86,11 +88,42 @@ static int write_all(URLContext *url, const uint8_t *data, int size)
     return 0;
 }
 
+static int set_omt_packet_metadata(AVPacket *packet, const char *xml)
+{
+    AVDictionary *metadata = NULL;
+    uint8_t *packed, *side_data;
+    size_t packed_size;
+    int ret;
+
+    if ((ret = av_dict_set(&metadata, "omt.xml", xml, 0)) < 0)
+        goto end;
+    packed = av_packet_pack_dictionary(metadata, &packed_size);
+    if (!packed) {
+        ret = AVERROR(ENOMEM);
+        goto end;
+    }
+    side_data = av_packet_new_side_data(packet, AV_PKT_DATA_STRINGS_METADATA,
+                                        packed_size);
+    if (!side_data) {
+        av_free(packed);
+        ret = AVERROR(ENOMEM);
+        goto end;
+    }
+    memcpy(side_data, packed, packed_size);
+    av_free(packed);
+    ret = 0;
+
+end:
+    av_dict_free(&metadata);
+    return ret;
+}
+
 static void *omt_test_server(void *arg)
 {
     OMTTestServer *server = arg;
     URLContext *client = NULL;
     uint8_t header[16], extended[32], message[128];
+    uint16_t metadata_size = server->test->metadata ? strlen(server->test->metadata) + 1 : 0;
     int width = server->test->codec == MKTAG('V', 'M', 'X', '1') ? 32 : 2;
     int height = width;
     int ret;
@@ -130,12 +163,15 @@ static void *omt_test_server(void *arg)
     header[0] = 1;
     header[1] = 2;
     AV_WL64(header + 2, 123);
-    AV_WL32(header + 12, sizeof(extended) + server->test->wire_size);
+    AV_WL16(header + 10, metadata_size);
+    AV_WL32(header + 12, sizeof(extended) + server->test->wire_size + metadata_size);
     ret = write_all(client, header, sizeof(header));
     if (ret >= 0)
         ret = write_all(client, extended, sizeof(extended));
     if (ret >= 0)
         ret = write_all(client, server->test->wire_data, server->test->wire_size);
+    if (ret >= 0 && metadata_size)
+        ret = write_all(client, (const uint8_t *)server->test->metadata, metadata_size);
 
 end:
     ffurl_closep(&client);
@@ -574,6 +610,23 @@ static int omt_test_one(const OMTTestCase *test)
         packet->size != test->expected_size ||
         memcmp(packet->data, test->expected_data, test->expected_size))
         ret = AVERROR_INVALIDDATA;
+    if (ret >= 0 && test->metadata) {
+        AVDictionary *metadata = NULL;
+        AVDictionaryEntry *entry;
+        size_t side_data_size;
+        uint8_t *side_data = av_packet_get_side_data(packet,
+                                                     AV_PKT_DATA_STRINGS_METADATA,
+                                                     &side_data_size);
+        if (!side_data || av_packet_unpack_dictionary(side_data, side_data_size,
+                                                       &metadata) < 0) {
+            ret = AVERROR_INVALIDDATA;
+        } else {
+            entry = av_dict_get(metadata, "omt.xml", NULL, 0);
+            if (!entry || strcmp(entry->value, test->metadata))
+                ret = AVERROR_INVALIDDATA;
+        }
+        av_dict_free(&metadata);
+    }
 
 end:
     av_packet_free(&packet);
@@ -723,12 +776,13 @@ static int omt_test_mux_one(const OMTTestCase *test)
     AVDictionary *options = NULL;
     AVStream *stream;
     char output_url[128], tcp_url[128];
-    uint8_t header[16], extended[32], wire_data[1024];
+    uint8_t header[16], extended[32], wire_data[1024], wire_metadata[512];
     int width = test->codec == MKTAG('V', 'M', 'X', '1') ? 32 : 2;
     int height = width;
     enum AVCodecID codec_id = test->codec == MKTAG('V', 'M', 'X', '1') ?
                               AV_CODEC_ID_VMIX : AV_CODEC_ID_RAWVIDEO;
     uint32_t size;
+    uint16_t metadata_size = test->metadata ? strlen(test->metadata) + 1 : 0;
     int port = -1, ret = AVERROR(EADDRINUSE), header_written = 0;
     const char *stage = "allocate output";
 
@@ -805,6 +859,8 @@ static int omt_test_mux_one(const OMTTestCase *test)
     if (ret < 0)
         goto end;
     memcpy(packet->data, test->expected_data, test->expected_size);
+    if (test->metadata && (ret = set_omt_packet_metadata(packet, test->metadata)) < 0)
+        goto end;
     packet->stream_index = 0;
     stage = "write test packet";
     packet->pts = packet->dts = 123;
@@ -820,7 +876,8 @@ static int omt_test_mux_one(const OMTTestCase *test)
     }
     size = AV_RL32(header + 12);
     if (header[0] != 1 || header[1] != 2 || AV_RL64(header + 2) != 41000000 ||
-        AV_RL16(header + 10) || size != sizeof(extended) + test->wire_size) {
+        AV_RL16(header + 10) != metadata_size ||
+        size != sizeof(extended) + test->wire_size + metadata_size) {
         av_log(NULL, AV_LOG_ERROR,
                "OMT mux frame header differs: version=%u type=%u pts=%"PRId64" size=%u\n",
                header[0], header[1], AV_RL64(header + 2), size);
@@ -851,8 +908,17 @@ static int omt_test_mux_one(const OMTTestCase *test)
         av_log(NULL, AV_LOG_ERROR, "OMT mux payload differs for codec %08x\n",
                test->codec);
         ret = AVERROR_INVALIDDATA;
-    } else
+    } else if (metadata_size) {
+        stage = "read OMT frame metadata";
+        ret = ffurl_read_complete(client, wire_metadata, metadata_size);
+        if (ret < 0 || ret != metadata_size ||
+            memcmp(wire_metadata, test->metadata, metadata_size))
+            ret = ret < 0 ? ret : AVERROR_INVALIDDATA;
+        else
+            ret = 0;
+    } else {
         ret = 0;
+    }
 
 end:
     if (ret < 0)
@@ -1190,6 +1256,7 @@ int main(void)
     static const uint8_t uyvy[] = {
         128, 16, 128, 64, 129, 32, 129, 80,
     };
+    static const char frame_metadata[] = "<OMTInfo ProductName=\"api-test\" />";
     static const uint8_t yuy2[] = {
         16, 128, 64, 128, 32, 129, 80, 129,
     };
@@ -1290,6 +1357,20 @@ int main(void)
         ret = omt_test_discovery_register();
     if (ret >= 0)
         ret = omt_test_discovery_resolve();
+    if (ret >= 0) {
+        OMTTestCase metadata_test = {
+            .codec = MKTAG('U', 'Y', 'V', 'Y'),
+            .pixel_format = AV_PIX_FMT_UYVY422,
+            .wire_data = uyvy,
+            .wire_size = sizeof(uyvy),
+            .expected_data = uyvy,
+            .expected_size = sizeof(uyvy),
+            .metadata = frame_metadata,
+        };
+        ret = omt_test_one(&metadata_test);
+        if (ret >= 0)
+            ret = omt_test_mux_one(&metadata_test);
+    }
     if (ret >= 0)
         ret = ff_omt_dns_sd_test();
     vmix_p216_size = av_base64_decode(vmix_p216_packet, vmix_p216_packet_base64,

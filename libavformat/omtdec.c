@@ -32,6 +32,8 @@
 #include "libavutil/mem.h"
 #include "libavutil/opt.h"
 
+#include "libavcodec/packet.h"
+
 #include "avformat.h"
 #include "demux.h"
 #include "internal.h"
@@ -358,6 +360,57 @@ static int omt_skip(URLContext *h, uint32_t size)
         size -= chunk;
     }
     return 0;
+}
+
+static int omt_read_packet_metadata(OMTContext *s, AVPacket *pkt, uint16_t size)
+{
+    AVDictionary *metadata = NULL;
+    AVDictionaryEntry *entry;
+    uint8_t *xml, *packed, *side_data;
+    size_t packed_size;
+    int ret;
+
+    if (!size)
+        return 0;
+    xml = av_malloc(size);
+    if (!xml)
+        return AVERROR(ENOMEM);
+    ret = ffurl_read_complete(s->tcp, xml, size);
+    if (ret < 0 || ret != size) {
+        av_free(xml);
+        return ret < 0 ? ret : AVERROR_EOF;
+    }
+    if (xml[size - 1] || memchr(xml, 0, size - 1)) {
+        av_free(xml);
+        return AVERROR_INVALIDDATA;
+    }
+    ret = av_dict_set(&metadata, "omt.xml", (const char *)xml, 0);
+    av_free(xml);
+    if (ret < 0)
+        goto end;
+    entry = av_dict_get(metadata, "omt.xml", NULL, 0);
+    if (!entry || !entry->value) {
+        ret = AVERROR_INVALIDDATA;
+        goto end;
+    }
+    packed = av_packet_pack_dictionary(metadata, &packed_size);
+    if (!packed) {
+        ret = AVERROR(ENOMEM);
+        goto end;
+    }
+    side_data = av_packet_new_side_data(pkt, AV_PKT_DATA_STRINGS_METADATA, packed_size);
+    if (!side_data) {
+        av_free(packed);
+        ret = AVERROR(ENOMEM);
+        goto end;
+    }
+    memcpy(side_data, packed, packed_size);
+    av_free(packed);
+    ret = 0;
+
+end:
+    av_dict_free(&metadata);
+    return ret;
 }
 
 static enum AVPixelFormat omt_pixel_format(uint32_t codec)
@@ -701,7 +754,7 @@ static int omt_read_packet(AVFormatContext *ctx, AVPacket *pkt)
                                          (AVRational){ 1, OMT_TIME_BASE });
         }
 
-        ret = omt_skip(s->tcp, metadata_length);
+        ret = omt_read_packet_metadata(s, pkt, metadata_length);
         if (ret < 0) {
             av_packet_unref(pkt);
             return ret;

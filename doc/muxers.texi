@@ -3388,6 +3388,9 @@ Maximum time in milliseconds to wait for each receiver connection. Default is
 30000.
 @end table
 
+API users can attach per-frame OMT XML metadata by placing it in
+@code{AV_PKT_DATA_STRINGS_METADATA} under the dictionary key @code{omt.xml}.
+
 @section mxf, mxf_d10, mxf_opatom
 
 MXF muxer.

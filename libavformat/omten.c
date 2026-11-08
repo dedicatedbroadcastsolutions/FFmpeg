@@ -27,6 +27,7 @@
 #include "libavutil/bprint.h"
 #include "libavutil/channel_layout.h"
 #include "libavutil/common.h"
+#include "libavutil/dict.h"
 #include "libavutil/intfloat.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/imgutils.h"
@@ -37,6 +38,7 @@
 #include "libavutil/threadmessage.h"
 
 #include "avformat.h"
+#include "libavcodec/packet.h"
 #include "internal.h"
 #include "mux.h"
 #include "network.h"
@@ -44,6 +46,7 @@
 #include "url.h"
 
 #define OMT_HEADER_SIZE 16
+#define OMT_XML_METADATA_KEY "omt.xml"
 #define OMT_VIDEO_HEADER_SIZE 32
 #define OMT_AUDIO_HEADER_SIZE 24
 #define OMT_TIME_BASE 10000000
@@ -289,12 +292,14 @@ end:
 
 static int omt_make_frame_packet(AVPacket **pkt, int type, int64_t pts,
                                  const uint8_t *extended, int extended_size,
-                                 const uint8_t *data, int data_size)
+                                 const uint8_t *data, int data_size,
+                                 const uint8_t *metadata, int metadata_size)
 {
-    uint64_t frame_size = (uint64_t)extended_size + data_size;
+    uint64_t frame_size = (uint64_t)extended_size + data_size + metadata_size;
     int ret;
 
-    if (frame_size > OMT_MAX_FRAME_SIZE ||
+    if (metadata_size < 0 || metadata_size > UINT16_MAX ||
+        (metadata_size && !metadata) || frame_size > OMT_MAX_FRAME_SIZE ||
         frame_size + OMT_HEADER_SIZE > INT_MAX)
         return AVERROR(EINVAL);
     *pkt = av_packet_alloc();
@@ -309,12 +314,15 @@ static int omt_make_frame_packet(AVPacket **pkt, int type, int64_t pts,
     (*pkt)->data[0] = 1;
     (*pkt)->data[1] = type;
     AV_WL64((*pkt)->data + 2, pts);
-    AV_WL16((*pkt)->data + 10, 0);
+    AV_WL16((*pkt)->data + 10, metadata_size);
     AV_WL32((*pkt)->data + 12, frame_size);
     if (extended_size)
         memcpy((*pkt)->data + OMT_HEADER_SIZE, extended, extended_size);
     if (data_size)
         memcpy((*pkt)->data + OMT_HEADER_SIZE + extended_size, data, data_size);
+    if (metadata_size)
+        memcpy((*pkt)->data + OMT_HEADER_SIZE + extended_size + data_size,
+               metadata, metadata_size);
     return 0;
 }
 
@@ -394,13 +402,14 @@ static void omt_reap_receivers(AVFormatContext *ctx, OMTMuxContext *s)
 
 static int omt_queue_frame(AVFormatContext *ctx, OMTMuxContext *s, int channel,
                            int type, int64_t pts, const uint8_t *extended,
-                           int extended_size, const uint8_t *data, int data_size)
+                           int extended_size, const uint8_t *data, int data_size,
+                           const uint8_t *metadata, int metadata_size)
 {
     AVPacket *pkt = NULL;
     int ret;
 
     ret = omt_make_frame_packet(&pkt, type, pts, extended, extended_size,
-                                data, data_size);
+                                data, data_size, metadata, metadata_size);
     if (ret < 0)
         return ret;
     ret = 0;
@@ -689,7 +698,8 @@ static int omt_video_header(AVFormatContext *ctx, AVStream *st,
     return 0;
 }
 
-static int omt_write_packet(AVFormatContext *ctx, AVPacket *pkt)
+static int omt_write_packet_internal(AVFormatContext *ctx, AVPacket *pkt,
+                                     const uint8_t *metadata, int metadata_size)
 {
     OMTMuxContext *s = ctx->priv_data;
     AVStream *st = ctx->streams[pkt->stream_index];
@@ -824,14 +834,48 @@ static int omt_write_packet(AVFormatContext *ctx, AVPacket *pkt)
         AV_WL32(header + 12, channels);
         AV_WL32(header + 16, channels == 32 ? UINT32_MAX : (1U << channels) - 1);
         ret = omt_queue_frame(ctx, s, channel, 4, pts, header, sizeof(header),
-                              planar, planar_size);
+                              planar, planar_size, metadata, metadata_size);
         av_free(planar);
         return ret;
     }
 
     ret = omt_queue_frame(ctx, s, channel, 2, pts, extended, sizeof(extended),
-                          media, media_size);
+                          media, media_size, metadata, metadata_size);
     av_free(converted_media);
+    return ret;
+}
+
+static int omt_write_packet(AVFormatContext *ctx, AVPacket *pkt)
+{
+    AVDictionary *metadata = NULL;
+    const AVDictionaryEntry *entry;
+    const uint8_t *xml = NULL;
+    size_t side_data_size;
+    int metadata_size = 0;
+    uint8_t *side_data;
+    int ret;
+
+    side_data = av_packet_get_side_data(pkt, AV_PKT_DATA_STRINGS_METADATA,
+                                        &side_data_size);
+    if (side_data) {
+        ret = av_packet_unpack_dictionary(side_data, side_data_size, &metadata);
+        if (ret < 0)
+            goto end;
+        entry = av_dict_get(metadata, OMT_XML_METADATA_KEY, NULL, 0);
+        if (entry) {
+            size_t size = strlen(entry->value) + 1;
+            if (size > UINT16_MAX) {
+                ret = AVERROR(EINVAL);
+                goto end;
+            }
+            xml = (const uint8_t *)entry->value;
+            metadata_size = size;
+        }
+    }
+    ret = omt_write_packet_internal(ctx, pkt, xml, metadata_size);
+
+end:
+    av_dict_free(&metadata);
     return ret;
 }
 
