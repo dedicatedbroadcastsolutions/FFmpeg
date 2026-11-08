@@ -501,7 +501,35 @@ static int omt_write_packet(AVFormatContext *ctx, AVPacket *pkt)
     if (channel == OMT_CHANNEL_VIDEO) {
         if ((ret = omt_video_header(ctx, st, extended)) < 0)
             return ret;
-        if (par->format == AV_PIX_FMT_YUVA422P ||
+        if (par->format == AV_PIX_FMT_YUV420P) {
+            uint8_t *planes[4];
+            int linesizes[4];
+            int expected = av_image_get_buffer_size(par->format, par->width,
+                                                    par->height, 1);
+            size_t luma_size = (size_t)par->width * par->height;
+            size_t chroma_size = luma_size / 4;
+
+            if (expected < 0 || expected > OMT_MAX_FRAME_SIZE - OMT_VIDEO_HEADER_SIZE ||
+                pkt->size != expected || ((par->width | par->height) & 1))
+                return AVERROR_INVALIDDATA;
+            ret = av_image_fill_arrays(planes, linesizes, pkt->data,
+                                       par->format, par->width, par->height, 1);
+            if (ret < 0)
+                return ret;
+            converted_media = av_malloc(pkt->size);
+            if (!converted_media)
+                return AVERROR(ENOMEM);
+            memcpy(converted_media, planes[0], luma_size);
+            for (int y = 0; y < par->height / 2; y++) {
+                memcpy(converted_media + luma_size + (size_t)y * (par->width / 2),
+                       planes[2] + (ptrdiff_t)y * linesizes[2], par->width / 2);
+                memcpy(converted_media + luma_size + chroma_size +
+                       (size_t)y * (par->width / 2),
+                       planes[1] + (ptrdiff_t)y * linesizes[1], par->width / 2);
+            }
+            media = converted_media;
+            media_size = pkt->size;
+        } else if (par->format == AV_PIX_FMT_YUVA422P ||
             par->format == AV_PIX_FMT_YUVA422P10LE) {
             uint8_t *planes[4];
             int linesizes[4];

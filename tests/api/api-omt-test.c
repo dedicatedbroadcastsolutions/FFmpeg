@@ -334,6 +334,12 @@ int main(void)
     static const uint8_t uyva_planar[] = {
         16, 64, 32, 80, 128, 129, 128, 129, 0, 64, 128, 255,
     };
+    static const uint8_t yv12_wire[] = {
+        16, 32, 64, 80, 200, 100,
+    };
+    static const uint8_t yv12_planar[] = {
+        16, 32, 64, 80, 100, 200,
+    };
     static const uint8_t pa16_wire[] = {
         0x00, 0x10, 0x40, 0x10, 0x80, 0x10, 0xc0, 0x10,
         0x00, 0x14, 0x80, 0x16, 0x40, 0x14, 0xc0, 0x16,
@@ -347,6 +353,8 @@ int main(void)
     static const OMTTestCase tests[] = {
         { MKTAG('B', 'G', 'R', 'X'), 0, AV_PIX_FMT_BGR0,
           bgrx, sizeof(bgrx), bgrx, sizeof(bgrx) },
+        { MKTAG('Y', 'V', '1', '2'), 0, AV_PIX_FMT_YUV420P,
+            yv12_wire, sizeof(yv12_wire), yv12_planar, sizeof(yv12_planar) },
         { MKTAG('U', 'Y', 'V', 'A'), 2, AV_PIX_FMT_YUVA422P,
           uyva_wire, sizeof(uyva_wire), uyva_planar, sizeof(uyva_planar) },
         { MKTAG('P', 'A', '1', '6'), 18, AV_PIX_FMT_YUVA422P10LE,

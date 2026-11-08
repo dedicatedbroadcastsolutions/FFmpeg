@@ -231,6 +231,16 @@ static void omt_unpack_pa16(uint8_t *dst, const uint8_t *src, int width, int hei
     }
 }
 
+static void omt_unpack_yv12(uint8_t *dst, const uint8_t *src, int width, int height)
+{
+    size_t luma_size = (size_t)width * height;
+    size_t chroma_size = luma_size / 4;
+
+    memcpy(dst, src, luma_size);
+    memcpy(dst + luma_size, src + luma_size + chroma_size, chroma_size);
+    memcpy(dst + luma_size + chroma_size, src + luma_size, chroma_size);
+}
+
 static int omt_add_video_stream(AVFormatContext *ctx, const uint8_t *header)
 {
     OMTContext *s = ctx->priv_data;
@@ -242,7 +252,8 @@ static int omt_add_video_stream(AVFormatContext *ctx, const uint8_t *header)
 
     if (width <= 0 || height <= 0 || width > 32768 || height > 32768 ||
         ((codec == MKTAG('U', 'Y', 'V', 'A') || codec == MKTAG('P', 'A', '1', '6')) &&
-         (width & 1)))
+         (width & 1)) ||
+        (codec == MKTAG('Y', 'V', '1', '2') && ((width | height) & 1)))
         return AVERROR_INVALIDDATA;
     if (codec == MKTAG('V', 'M', 'X', '1')) {
         if (flags & (1 | 2 | 8 | 16)) {
@@ -408,7 +419,8 @@ static int omt_read_packet(AVFormatContext *ctx, AVPacket *pkt)
                     return AVERROR_INVALIDDATA;
             }
             if (s->codec_tag == MKTAG('U', 'Y', 'V', 'A') ||
-                s->codec_tag == MKTAG('P', 'A', '1', '6')) {
+                s->codec_tag == MKTAG('P', 'A', '1', '6') ||
+                s->codec_tag == MKTAG('Y', 'V', '1', '2')) {
                 uint8_t *wire = av_malloc(media_length);
                 if (!wire)
                     return AVERROR(ENOMEM);
@@ -421,8 +433,10 @@ static int omt_read_packet(AVFormatContext *ctx, AVPacket *pkt)
                 if (ret >= 0) {
                     if (s->codec_tag == MKTAG('U', 'Y', 'V', 'A'))
                         omt_unpack_uyva(pkt->data, wire, s->width, s->height);
-                    else
+                    else if (s->codec_tag == MKTAG('P', 'A', '1', '6'))
                         omt_unpack_pa16(pkt->data, wire, s->width, s->height);
+                    else
+                        omt_unpack_yv12(pkt->data, wire, s->width, s->height);
                 }
                 av_free(wire);
                 if (ret < 0)
