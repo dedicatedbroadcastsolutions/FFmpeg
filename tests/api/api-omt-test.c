@@ -80,6 +80,12 @@ typedef struct OMTDiscoveryResolverTestServer {
     int result;
 } OMTDiscoveryResolverTestServer;
 
+typedef struct OMTRedirectTestServer {
+    URLContext *listener;
+    const char *redirect_url;
+    int result;
+} OMTRedirectTestServer;
+
 static int write_all(URLContext *url, const uint8_t *data, int size)
 {
     int written = 0;
@@ -603,6 +609,140 @@ end:
         ret = registry_server.result < 0 ? registry_server.result : media_server.result;
     if (ret < 0)
         av_log(NULL, AV_LOG_ERROR, "OMT discovery resolve test failed: %s\n", av_err2str(ret));
+    return ret;
+}
+
+static void *omt_redirect_test_server(void *arg)
+{
+    OMTRedirectTestServer *server = arg;
+    URLContext *client = NULL;
+    uint8_t header[16], message[128];
+    char xml[256];
+    int ret;
+
+    ret = ffurl_accept(server->listener, &client);
+    if (ret < 0)
+        goto end;
+    for (int i = 0; i < 3; i++) {
+        ret = ffurl_read_complete(client, header, sizeof(header));
+        if (ret < 0 || ret != sizeof(header) || header[0] != 1 || header[1] != 1) {
+            ret = ret < 0 ? ret : AVERROR_INVALIDDATA;
+            goto end;
+        }
+        uint32_t size = AV_RL32(header + 12);
+        if (!size || size > sizeof(message)) {
+            ret = AVERROR_INVALIDDATA;
+            goto end;
+        }
+        ret = ffurl_read_complete(client, message, size);
+        if (ret < 0 || ret != size) {
+            ret = ret < 0 ? ret : AVERROR_EOF;
+            goto end;
+        }
+    }
+    snprintf(xml, sizeof(xml), "<OMTRedirect NewAddress=\"%s\" />",
+             server->redirect_url);
+    memset(header, 0, sizeof(header));
+    header[0] = 1;
+    header[1] = 1;
+    AV_WL32(header + 12, strlen(xml) + 1);
+    ret = write_all(client, header, sizeof(header));
+    if (ret >= 0)
+        ret = write_all(client, (const uint8_t *)xml, strlen(xml) + 1);
+
+end:
+    ffurl_closep(&client);
+    server->result = ret;
+    return NULL;
+}
+
+static int omt_test_redirect(void)
+{
+    static const uint8_t wire_data[] = { 128, 16, 128, 64, 129, 32, 129, 80 };
+    OMTTestCase test = {
+        MKTAG('U', 'Y', 'V', 'Y'), 0, AV_PIX_FMT_UYVY422,
+        wire_data, sizeof(wire_data), wire_data, sizeof(wire_data),
+    };
+    OMTTestServer media_server = { .test = &test };
+    OMTRedirectTestServer redirect_server = { 0 };
+    AVFormatContext *format = NULL;
+    AVPacket *packet = NULL;
+    pthread_t media_thread, redirect_thread;
+    int media_thread_started = 0, redirect_thread_started = 0;
+    int media_port = -1, redirect_port = -1;
+    int ret = AVERROR(EADDRINUSE);
+    char listener_url[128], input_url[128], redirect_url[128];
+
+    for (int i = 0; i < 128; i++) {
+        media_port = 49152 + (av_get_random_seed() + i * 6151) % (65536 - 49152);
+        snprintf(listener_url, sizeof(listener_url),
+                 "tcp://127.0.0.1:%d?listen=2&listen_timeout=5000&timeout=5000000",
+                 media_port);
+        ret = ffurl_open_whitelist(&media_server.listener, listener_url,
+                                   AVIO_FLAG_READ_WRITE, NULL, NULL, NULL, NULL, NULL);
+        if (ret >= 0)
+            break;
+    }
+    if (ret < 0)
+        goto end;
+    snprintf(redirect_url, sizeof(redirect_url), "omt://127.0.0.1:%d", media_port);
+    redirect_server.redirect_url = redirect_url;
+    for (int i = 0; i < 128; i++) {
+        redirect_port = 49152 + (av_get_random_seed() + i * 4421) % (65536 - 49152);
+        if (redirect_port == media_port)
+            continue;
+        snprintf(listener_url, sizeof(listener_url),
+                 "tcp://127.0.0.1:%d?listen=2&listen_timeout=5000&timeout=5000000",
+                 redirect_port);
+        ret = ffurl_open_whitelist(&redirect_server.listener, listener_url,
+                                   AVIO_FLAG_READ_WRITE, NULL, NULL, NULL, NULL, NULL);
+        if (ret >= 0)
+            break;
+    }
+    if (ret < 0)
+        goto end;
+    ret = pthread_create(&media_thread, NULL, omt_test_server, &media_server);
+    if (ret) {
+        ret = AVERROR(ret);
+        goto end;
+    }
+    media_thread_started = 1;
+    ret = pthread_create(&redirect_thread, NULL, omt_redirect_test_server,
+                         &redirect_server);
+    if (ret) {
+        ret = AVERROR(ret);
+        goto end;
+    }
+    redirect_thread_started = 1;
+    snprintf(input_url, sizeof(input_url), "omt://127.0.0.1:%d", redirect_port);
+    ret = avformat_open_input(&format, input_url, av_find_input_format("omt"), NULL);
+    if (ret < 0)
+        goto end;
+    packet = av_packet_alloc();
+    if (!packet) {
+        ret = AVERROR(ENOMEM);
+        goto end;
+    }
+    ret = av_read_frame(format, packet);
+    if (ret < 0)
+        goto end;
+    if (packet->size != sizeof(wire_data) ||
+        memcmp(packet->data, wire_data, sizeof(wire_data)))
+        ret = AVERROR_INVALIDDATA;
+
+end:
+    av_packet_free(&packet);
+    avformat_close_input(&format);
+    ffurl_closep(&redirect_server.listener);
+    ffurl_closep(&media_server.listener);
+    if (redirect_thread_started)
+        pthread_join(redirect_thread, NULL);
+    if (media_thread_started)
+        pthread_join(media_thread, NULL);
+    if (ret >= 0 && (redirect_server.result < 0 || media_server.result < 0))
+        ret = redirect_server.result < 0 ? redirect_server.result : media_server.result;
+    if (ret < 0)
+        av_log(NULL, AV_LOG_ERROR, "OMT redirect test failed: %s\n", av_err2str(ret));
     return ret;
 }
 
@@ -1490,6 +1630,8 @@ int main(void)
         ret = omt_test_discovery_register();
     if (ret >= 0)
         ret = omt_test_discovery_resolve();
+    if (ret >= 0)
+        ret = omt_test_redirect();
     if (ret >= 0) {
         OMTTestCase metadata_test = {
             .codec = MKTAG('U', 'Y', 'V', 'Y'),

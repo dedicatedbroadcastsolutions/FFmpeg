@@ -46,6 +46,7 @@
 #define OMT_TIME_BASE 10000000
 #define OMT_MAX_FRAME_SIZE (256 * 1024 * 1024)
 #define OMT_MAX_DISCOVERY_MESSAGE (64 * 1024)
+#define OMT_MAX_REDIRECTS 16
 
 enum OMTChannel {
     OMT_CHANNEL_VIDEO,
@@ -64,6 +65,7 @@ typedef struct OMTContext {
     int64_t rw_timeout;
     char *source_name;
     char *discovery_server;
+    int redirect_count;
 } OMTContext;
 
 #define OFFSET(x) offsetof(OMTContext, x)
@@ -203,7 +205,8 @@ static int omt_parse_address(const char *xml, const char *source_name,
 }
 
 static int omt_resolve_source(AVFormatContext *ctx, OMTContext *s,
-                              const char *server_url, char *source_host,
+                              const char *server_url, const char *source_name,
+                              char *source_host,
                               size_t source_host_size, int *source_port)
 {
     static const char subscribe[] = "<OMTSubscribe Metadata=\"true\" />";
@@ -264,7 +267,7 @@ static int omt_resolve_source(AVFormatContext *ctx, OMTContext *s,
         if (xml[size - 1] == 0)
             size--;
         xml[size] = 0;
-        ret = omt_parse_address(xml, s->source_name, source_host,
+        ret = omt_parse_address(xml, source_name, source_host,
                                 source_host_size, source_port);
         if (ret == AVERROR(EAGAIN))
             continue;
@@ -281,28 +284,156 @@ end:
     return ret;
 }
 
+static int omt_resolve_name(AVFormatContext *ctx, OMTContext *s, const char *name,
+                            char *hostname, size_t hostname_size, int *port)
+{
+    int ret = AVERROR(ENOENT);
+
+    if (s->discovery_server)
+        ret = omt_resolve_source(ctx, s, s->discovery_server, name,
+                                 hostname, hostname_size, port);
+    if (!s->discovery_server || (ret < 0 && ret != AVERROR_EXIT)) {
+        if (s->discovery_server)
+            av_log(ctx, AV_LOG_VERBOSE,
+                   "Discovery Server lookup failed; trying DNS-SD\n");
+        ret = ff_omt_dns_sd_resolve(name, hostname, hostname_size, port,
+                                    &ctx->interrupt_callback,
+                                    s->rw_timeout ? s->rw_timeout : 5 * AV_TIME_BASE,
+                                    ctx);
+    }
+    return ret;
+}
+
+static int omt_connect_endpoint(AVFormatContext *ctx, OMTContext *s,
+                                const char *hostname, int port)
+{
+    char tcp_url[1024];
+    AVDictionary *options = NULL;
+    int ret;
+
+    ret = ff_url_join(tcp_url, sizeof(tcp_url), "tcp", NULL, hostname, port, NULL);
+    if (ret < 0 || ret >= sizeof(tcp_url))
+        return AVERROR(EINVAL);
+    ret = av_dict_set_int(&options, "rw_timeout", s->rw_timeout, 0);
+    if (ret < 0)
+        goto end;
+    ret = ffurl_open_whitelist(&s->tcp, tcp_url, AVIO_FLAG_READ_WRITE,
+                               &ctx->interrupt_callback, &options,
+                               ctx->protocol_whitelist, ctx->protocol_blacklist, NULL);
+    if (ret < 0)
+        goto end;
+
+    ret = omt_send_metadata(s, "<OMTSubscribe Metadata=\"true\" />");
+    if (ret >= 0)
+        ret = omt_send_metadata(s, s->channel == OMT_CHANNEL_VIDEO ?
+                                "<OMTSubscribe Video=\"true\" />" :
+                                "<OMTSubscribe Audio=\"true\" />");
+    if (ret >= 0 && s->channel == OMT_CHANNEL_VIDEO)
+        ret = omt_send_metadata(s, "<OMTSettings Quality=\"Default\" />");
+    if (ret < 0)
+        ffurl_closep(&s->tcp);
+
+end:
+    av_dict_free(&options);
+    return ret;
+}
+
+static int omt_parse_redirect(const char *xml, char *address, size_t address_size)
+{
+    const char *tag = strstr(xml, "<OMTRedirect");
+    const char *end, *value;
+    char quote;
+    size_t written = 0;
+
+    if (!tag)
+        return AVERROR(EAGAIN);
+    if (!(end = strchr(tag, '>')) || !(value = strstr(tag, "NewAddress")) || value > end)
+        return AVERROR_INVALIDDATA;
+    value += strlen("NewAddress");
+    while (*value == ' ' || *value == '\t')
+        value++;
+    if (*value++ != '=')
+        return AVERROR_INVALIDDATA;
+    while (*value == ' ' || *value == '\t')
+        value++;
+    quote = *value++;
+    if (quote != '\'' && quote != '"')
+        return AVERROR_INVALIDDATA;
+    while (*value && *value != quote) {
+        const char *entity = NULL;
+        char decoded = 0;
+        if (*value == '&') {
+            if (!strncmp(value, "&amp;", 5)) entity = value + 5, decoded = '&';
+            else if (!strncmp(value, "&lt;", 4)) entity = value + 4, decoded = '<';
+            else if (!strncmp(value, "&gt;", 4)) entity = value + 4, decoded = '>';
+            else if (!strncmp(value, "&quot;", 6)) entity = value + 6, decoded = '"';
+            else if (!strncmp(value, "&apos;", 6)) entity = value + 6, decoded = '\'';
+            if (!entity)
+                return AVERROR_INVALIDDATA;
+        }
+        if (written + 1 >= address_size)
+            return AVERROR(ENOSPC);
+        if (entity) {
+            address[written++] = decoded;
+            value = entity;
+        } else {
+            address[written++] = *value++;
+        }
+    }
+    if (*value != quote)
+        return AVERROR_INVALIDDATA;
+    address[written] = 0;
+    return 0;
+}
+
+static int omt_resolve_address(AVFormatContext *ctx, OMTContext *s,
+                               const char *address, char *hostname,
+                               size_t hostname_size, int *port)
+{
+    char protocol[16], path[1024], authorization[256];
+
+    if (!address || !address[0]) {
+        if (s->source_name)
+            return omt_resolve_name(ctx, s, s->source_name,
+                                    hostname, hostname_size, port);
+        address = ctx->url;
+    }
+    if (!strncmp(address, "omt://", 6)) {
+        av_url_split(protocol, sizeof(protocol), authorization, sizeof(authorization),
+                     hostname, hostname_size, port, path, sizeof(path), address);
+        return !strcmp(protocol, "omt") && hostname[0] && *port > 0 && *port <= 65535 ?
+               0 : AVERROR(EINVAL);
+    }
+    return omt_resolve_name(ctx, s, address, hostname, hostname_size, port);
+}
+
+static int omt_follow_redirect(AVFormatContext *ctx, OMTContext *s, const char *address)
+{
+    char hostname[256];
+    int port = -1, ret;
+
+    if (++s->redirect_count > OMT_MAX_REDIRECTS)
+        return AVERROR(ELOOP);
+    ret = omt_resolve_address(ctx, s, address, hostname, sizeof(hostname), &port);
+    if (ret < 0)
+        return ret;
+    ffurl_closep(&s->tcp);
+    s->stream = NULL;
+    s->codec_tag = 0;
+    s->width = 0;
+    s->height = 0;
+    return omt_connect_endpoint(ctx, s, hostname, port);
+}
+
 static int omt_open(AVFormatContext *ctx)
 {
     OMTContext *s = ctx->priv_data;
     char protocol[16], hostname[256], path[1024], authorization[256];
-    char tcp_url[1024];
-    AVDictionary *options = NULL;
     int port = -1, ret;
 
     if (s->source_name) {
-        if (s->discovery_server) {
-            ret = omt_resolve_source(ctx, s, s->discovery_server,
-                                     hostname, sizeof(hostname), &port);
-        }
-        if (!s->discovery_server || (ret < 0 && ret != AVERROR_EXIT)) {
-            if (s->discovery_server)
-                av_log(ctx, AV_LOG_VERBOSE,
-                       "Discovery Server lookup failed; trying DNS-SD\n");
-            ret = ff_omt_dns_sd_resolve(s->source_name, hostname, sizeof(hostname),
-                                        &port, &ctx->interrupt_callback,
-                                        s->rw_timeout ? s->rw_timeout : 5 * AV_TIME_BASE,
-                                        ctx);
-        }
+        ret = omt_resolve_name(ctx, s, s->source_name,
+                               hostname, sizeof(hostname), &port);
         if (ret < 0) {
             av_log(ctx, AV_LOG_ERROR, "Could not resolve OMT source '%s': %s\n",
                    s->source_name, av_err2str(ret));
@@ -320,31 +451,7 @@ static int omt_open(AVFormatContext *ctx)
             return AVERROR(EINVAL);
         }
     }
-    ret = ff_url_join(tcp_url, sizeof(tcp_url), "tcp", NULL, hostname, port, NULL);
-    if (ret < 0 || ret >= sizeof(tcp_url))
-        return AVERROR(EINVAL);
-    ret = av_dict_set_int(&options, "rw_timeout", s->rw_timeout, 0);
-    if (ret < 0) {
-        av_dict_free(&options);
-        return ret;
-    }
-    ret = ffurl_open_whitelist(&s->tcp, tcp_url, AVIO_FLAG_READ_WRITE,
-                               &ctx->interrupt_callback, &options,
-                               ctx->protocol_whitelist, ctx->protocol_blacklist, NULL);
-    av_dict_free(&options);
-    if (ret < 0)
-        return ret;
-
-    ret = omt_send_metadata(s, "<OMTSubscribe Metadata=\"true\" />");
-    if (ret >= 0)
-        ret = omt_send_metadata(s, s->channel == OMT_CHANNEL_VIDEO ?
-                                "<OMTSubscribe Video=\"true\" />" :
-                                "<OMTSubscribe Audio=\"true\" />");
-    if (ret >= 0 && s->channel == OMT_CHANNEL_VIDEO)
-        ret = omt_send_metadata(s, "<OMTSettings Quality=\"Default\" />");
-    if (ret < 0)
-        ffurl_closep(&s->tcp);
-    return ret;
+    return omt_connect_endpoint(ctx, s, hostname, port);
 }
 
 static int omt_skip(URLContext *h, uint32_t size)
@@ -655,9 +762,6 @@ static int omt_read_packet(AVFormatContext *ctx, AVPacket *pkt)
         if (data_length > OMT_MAX_FRAME_SIZE || data_length < metadata_length)
             return AVERROR_INVALIDDATA;
         if (header[1] == 1) {
-            ret = omt_add_metadata_stream(ctx);
-            if (ret < 0)
-                return ret;
             ret = av_new_packet(pkt, data_length);
             if (ret < 0)
                 return ret;
@@ -665,6 +769,29 @@ static int omt_read_packet(AVFormatContext *ctx, AVPacket *pkt)
             if (ret < 0 || ret != data_length) {
                 av_packet_unref(pkt);
                 return ret < 0 ? ret : AVERROR_EOF;
+            }
+            if (data_length && !pkt->data[data_length - 1] &&
+                !memchr(pkt->data, 0, data_length - 1)) {
+                char address[1024];
+                ret = omt_parse_redirect((const char *)pkt->data,
+                                         address, sizeof(address));
+                if (ret == 0) {
+                    av_packet_unref(pkt);
+                    ret = omt_follow_redirect(ctx, s, address);
+                    if (ret < 0)
+                        return ret;
+                    continue;
+                }
+                if (ret != AVERROR(EAGAIN) &&
+                    !strncmp((const char *)pkt->data, "<OMTRedirect", 12)) {
+                    av_packet_unref(pkt);
+                    return ret;
+                }
+            }
+            ret = omt_add_metadata_stream(ctx);
+            if (ret < 0) {
+                av_packet_unref(pkt);
+                return ret;
             }
             pkt->stream_index = s->metadata_stream->index;
             pkt->pts = pkt->dts = timestamp;

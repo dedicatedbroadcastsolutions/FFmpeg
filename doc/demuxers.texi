@@ -1062,6 +1062,8 @@ This demuxer connects directly to an OMT sender by host and port. Use
 It can also resolve a named source by setting @option{source_name}. DNS-SD is
 used by default; set @option{discovery_server} to use a registry instead.
 In DNS-SD mode, the URL is ignored; use @code{omt://} with @code{-f omt}.
+The demuxer follows OMT @code{OMTRedirect} metadata and reconnects to the new
+URL or discovered source, with a limit of 16 consecutive redirects.
 
 @table @option
 @item channel
