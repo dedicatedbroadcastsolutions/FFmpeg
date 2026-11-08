@@ -992,7 +992,7 @@ end:
     return ret;
 }
 
-static int omt_test_mux_one(const OMTTestCase *test)
+static int omt_test_mux_one(const OMTTestCase *test, int codec_framerate_only)
 {
     AVFormatContext *format = NULL;
     AVPacket *packet = NULL;
@@ -1033,8 +1033,11 @@ static int omt_test_mux_one(const OMTTestCase *test)
             test->pixel_format == AV_PIX_FMT_YUVA422P10LE || codec_id == AV_CODEC_ID_VMIX ?
             10 : 8;
         stream->time_base = (AVRational){ 1, 30 };
-        stream->r_frame_rate = (AVRational){ 30, 1 };
-        stream->avg_frame_rate = (AVRational){ 30, 1 };
+        stream->codecpar->framerate = (AVRational){ 30, 1 };
+        stream->r_frame_rate = codec_framerate_only ? (AVRational){ 0, 1 } :
+                       (AVRational){ 30, 1 };
+        stream->avg_frame_rate = codec_framerate_only ? (AVRational){ 0, 1 } :
+                     (AVRational){ 30, 1 };
         stream->sample_aspect_ratio = (AVRational){ 1, 1 };
         if (test->product_name &&
             (ret = av_dict_set(&format->metadata, "product_name", test->product_name, 0)) < 0)
@@ -1632,7 +1635,7 @@ int main(void)
     for (unsigned i = 0; i < FF_ARRAY_ELEMS(tests); i++) {
         ret = omt_test_one(&tests[i]);
         if (ret >= 0)
-            ret = omt_test_mux_one(&tests[i]);
+            ret = omt_test_mux_one(&tests[i], 0);
         if (ret < 0) {
             av_log(NULL, AV_LOG_ERROR, "OMT API test %u failed: %s\n",
                    i, av_err2str(ret));
@@ -1647,6 +1650,11 @@ int main(void)
                                  audio_planar, sizeof(audio_planar));
     if (ret < 0)
         av_log(NULL, AV_LOG_ERROR, "OMT API audio test failed: %s\n", av_err2str(ret));
+    if (ret >= 0)
+        ret = omt_test_mux_one(&tests[0], 1);
+    if (ret < 0)
+        av_log(NULL, AV_LOG_ERROR, "OMT API frame-rate fallback test failed: %s\n",
+               av_err2str(ret));
     if (ret >= 0)
         ret = omt_test_slow_receiver_isolation();
     if (ret >= 0)
@@ -1675,7 +1683,7 @@ int main(void)
         };
         ret = omt_test_one(&metadata_test);
         if (ret >= 0)
-            ret = omt_test_mux_one(&metadata_test);
+            ret = omt_test_mux_one(&metadata_test, 0);
     }
     if (ret >= 0)
         ret = ff_omt_dns_sd_test();
@@ -1691,7 +1699,7 @@ int main(void)
         };
         ret = omt_test_one(&vmix_test);
         if (ret >= 0)
-            ret = omt_test_mux_one(&vmix_test);
+            ret = omt_test_mux_one(&vmix_test, 0);
         if (ret < 0)
             av_log(NULL, AV_LOG_ERROR, "OMT API 10-bit VMX1 test failed: %s\n",
                    av_err2str(ret));

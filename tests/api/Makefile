@@ -12,6 +12,16 @@ APITESTPROGS-$(call DEMDEC, H263, H263) += api-band
 APITESTPROGS-$(HAVE_THREADS) += api-threadmessage
 APITESTPROGS-$(CONFIG_AVCODEC) += api-enc-info
 APITESTPROGS-$(call ALLYES, H261_ENCODER H261_PARSER) += api-enc-parser
+ifneq ($(strip $(LIBVMX_ROOT)),)
+APITESTPROGS-yes += api-vmix-bench
+$(APITESTSDIR)/api-vmix-bench-test.o: CPPFLAGS += -I$(LIBVMX_ROOT)/src
+$(APITESTSDIR)/api-vmix-bench-test$(EXESUF): ELIBS += -L$(LIBVMX_ROOT)/build -Wl,-rpath,$(LIBVMX_ROOT)/build -lvmx
+endif
+ifneq ($(strip $(LIBOMT_ROOT)),)
+APITESTPROGS-yes += api-omt-bench
+$(APITESTSDIR)/api-omt-bench-test.o: CPPFLAGS += -isystem $(LIBOMT_ROOT)
+$(APITESTSDIR)/api-omt-bench-test$(EXESUF): ELIBS += -L$(LIBOMT_ROOT)/bin/Release/net8.0/linux-x64/native -Wl,-rpath,$(LIBOMT_ROOT)/bin/Release/net8.0/linux-x64/native -lomt
+endif
 APITESTPROGS += $(APITESTPROGS-yes)
 
 APITESTOBJS  := $(APITESTOBJS:%=$(APITESTSDIR)%) $(APITESTPROGS:%=$(APITESTSDIR)/%-test.o)

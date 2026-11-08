@@ -891,6 +891,9 @@ static int omt_video_header(AVFormatContext *ctx, AVStream *st,
     int width = par->width, height = par->height;
     float aspect;
 
+    if (frame_rate.num <= 0 || frame_rate.den <= 0)
+        frame_rate = par->framerate;
+
     if (par->codec_id == AV_CODEC_ID_VMIX) {
         if (par->bits_per_raw_sample > 10 ||
             (par->bits_per_raw_sample > 8 && par->bits_per_raw_sample != 10)) {
@@ -936,8 +939,11 @@ static int omt_video_header(AVFormatContext *ctx, AVStream *st,
                avcodec_get_name(par->codec_id));
         return AVERROR_PATCHWELCOME;
     }
-    if (width <= 0 || height <= 0 || frame_rate.num <= 0 || frame_rate.den <= 0)
+    if (width <= 0 || height <= 0 || frame_rate.num <= 0 || frame_rate.den <= 0) {
+        av_log(ctx, AV_LOG_ERROR, "Invalid OMT video dimensions or frame rate: %dx%d at %d/%d\n",
+               width, height, frame_rate.num, frame_rate.den);
         return AVERROR_INVALIDDATA;
+    }
     memset(header, 0, OMT_VIDEO_HEADER_SIZE);
     AV_WL32(header, codec);
     AV_WL32(header + 4, width);
