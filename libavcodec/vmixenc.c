@@ -219,12 +219,14 @@ static av_cold int vmix_encode_init(AVCodecContext *avctx)
 
     if ((avctx->pix_fmt != AV_PIX_FMT_YUV422P &&
          avctx->pix_fmt != AV_PIX_FMT_UYVY422 &&
-         avctx->pix_fmt != AV_PIX_FMT_YUYV422) ||
+            avctx->pix_fmt != AV_PIX_FMT_YUYV422 &&
+            avctx->pix_fmt != AV_PIX_FMT_NV12 &&
+            avctx->pix_fmt != AV_PIX_FMT_YUV420P) ||
         avctx->width < 16 || avctx->height < 16 ||
         avctx->width > 7680 || avctx->height > 4080 ||
         avctx->width % 16 || avctx->height % 16) {
         av_log(avctx, AV_LOG_ERROR,
-               "VMIX encoder requires YUV422P, UYVY422, or YUYV422 dimensions divisible by 16\n");
+               "VMIX encoder requires YUV422P, UYVY422, YUYV422, NV12, or YUV420P dimensions divisible by 16\n");
         return AVERROR(EINVAL);
     }
     avctx->bits_per_raw_sample = 8;
@@ -262,6 +264,17 @@ static int vmix_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
             if (!frame->data[plane] || FFABS(frame->linesize[plane]) < width)
                 return AVERROR(EINVAL);
         }
+    } else if (frame->format == AV_PIX_FMT_NV12) {
+        if (!frame->data[0] || !frame->data[1] ||
+            FFABS(frame->linesize[0]) < frame->width ||
+            FFABS(frame->linesize[1]) < frame->width)
+            return AVERROR(EINVAL);
+    } else if (frame->format == AV_PIX_FMT_YUV420P) {
+        if (!frame->data[0] || !frame->data[1] || !frame->data[2] ||
+            FFABS(frame->linesize[0]) < frame->width ||
+            FFABS(frame->linesize[1]) < frame->width / 2 ||
+            FFABS(frame->linesize[2]) < frame->width / 2)
+            return AVERROR(EINVAL);
     } else if (!frame->data[0] || FFABS(frame->linesize[0]) < frame->width * 2) {
         return AVERROR(EINVAL);
     }
@@ -299,22 +312,45 @@ static int vmix_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
         planar_frame.data[2] = planar_data + luma_size + chroma_size;
         planar_frame.linesize[0] = frame->width;
         planar_frame.linesize[1] = planar_frame.linesize[2] = frame->width / 2;
-        for (int y = 0; y < frame->height; y++) {
-            const uint8_t *src = frame->data[0] + (ptrdiff_t)y * frame->linesize[0];
-            uint8_t *dst_y = planar_frame.data[0] + (ptrdiff_t)y * planar_frame.linesize[0];
-            uint8_t *dst_u = planar_frame.data[1] + (ptrdiff_t)y * planar_frame.linesize[1];
-            uint8_t *dst_v = planar_frame.data[2] + (ptrdiff_t)y * planar_frame.linesize[2];
-            for (int x = 0; x < frame->width; x += 2) {
-                if (frame->format == AV_PIX_FMT_UYVY422) {
-                    dst_u[x / 2] = src[x * 2];
-                    dst_y[x] = src[x * 2 + 1];
-                    dst_v[x / 2] = src[x * 2 + 2];
-                    dst_y[x + 1] = src[x * 2 + 3];
-                } else {
-                    dst_y[x] = src[x * 2];
-                    dst_u[x / 2] = src[x * 2 + 1];
-                    dst_y[x + 1] = src[x * 2 + 2];
-                    dst_v[x / 2] = src[x * 2 + 3];
+        if (frame->format == AV_PIX_FMT_NV12 || frame->format == AV_PIX_FMT_YUV420P) {
+            for (int y = 0; y < frame->height; y++)
+                memcpy(planar_frame.data[0] + (ptrdiff_t)y * planar_frame.linesize[0],
+                       frame->data[0] + (ptrdiff_t)y * frame->linesize[0], frame->width);
+            for (int y = 0; y < frame->height / 2; y++) {
+                const uint8_t *uv = frame->format == AV_PIX_FMT_NV12 ?
+                                    frame->data[1] + (ptrdiff_t)y * frame->linesize[1] : NULL;
+                const uint8_t *u = frame->format == AV_PIX_FMT_YUV420P ?
+                                   frame->data[1] + (ptrdiff_t)y * frame->linesize[1] : uv;
+                const uint8_t *v = frame->format == AV_PIX_FMT_YUV420P ?
+                                   frame->data[2] + (ptrdiff_t)y * frame->linesize[2] : uv + 1;
+                uint8_t *u0 = planar_frame.data[1] + (ptrdiff_t)(y * 2) * planar_frame.linesize[1];
+                uint8_t *u1 = u0 + planar_frame.linesize[1];
+                uint8_t *v0 = planar_frame.data[2] + (ptrdiff_t)(y * 2) * planar_frame.linesize[2];
+                uint8_t *v1 = v0 + planar_frame.linesize[2];
+                for (int x = 0; x < frame->width / 2; x++) {
+                    int source_x = frame->format == AV_PIX_FMT_NV12 ? x * 2 : x;
+                    u0[x] = u1[x] = u[source_x];
+                    v0[x] = v1[x] = v[frame->format == AV_PIX_FMT_NV12 ? source_x : x];
+                }
+            }
+        } else {
+            for (int y = 0; y < frame->height; y++) {
+                const uint8_t *src = frame->data[0] + (ptrdiff_t)y * frame->linesize[0];
+                uint8_t *dst_y = planar_frame.data[0] + (ptrdiff_t)y * planar_frame.linesize[0];
+                uint8_t *dst_u = planar_frame.data[1] + (ptrdiff_t)y * planar_frame.linesize[1];
+                uint8_t *dst_v = planar_frame.data[2] + (ptrdiff_t)y * planar_frame.linesize[2];
+                for (int x = 0; x < frame->width; x += 2) {
+                    if (frame->format == AV_PIX_FMT_UYVY422) {
+                        dst_u[x / 2] = src[x * 2];
+                        dst_y[x] = src[x * 2 + 1];
+                        dst_v[x / 2] = src[x * 2 + 2];
+                        dst_y[x + 1] = src[x * 2 + 3];
+                    } else {
+                        dst_y[x] = src[x * 2];
+                        dst_u[x / 2] = src[x * 2 + 1];
+                        dst_y[x + 1] = src[x * 2 + 2];
+                        dst_v[x / 2] = src[x * 2 + 3];
+                    }
                 }
             }
         }
@@ -390,5 +426,6 @@ const FFCodec ff_vmix_encoder = {
     .priv_data_size   = sizeof(VMIXEncContext),
     .init             = vmix_encode_init,
     FF_CODEC_ENCODE_CB(vmix_encode_frame),
-    CODEC_PIXFMTS(AV_PIX_FMT_YUV422P, AV_PIX_FMT_UYVY422, AV_PIX_FMT_YUYV422),
+    CODEC_PIXFMTS(AV_PIX_FMT_YUV422P, AV_PIX_FMT_UYVY422, AV_PIX_FMT_YUYV422,
+                  AV_PIX_FMT_NV12, AV_PIX_FMT_YUV420P),
 };
