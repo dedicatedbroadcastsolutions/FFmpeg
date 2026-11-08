@@ -23,6 +23,7 @@
 #include "libavutil/channel_layout.h"
 #include "libavutil/imgutils.h"
 #include "libavutil/common.h"
+#include "libavutil/dict.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/intfloat.h"
 #include "libavutil/mem.h"
@@ -52,6 +53,7 @@ typedef struct OMTContext {
     uint32_t codec_tag;
     int width;
     int height;
+    int64_t rw_timeout;
 } OMTContext;
 
 #define OFFSET(x) offsetof(OMTContext, x)
@@ -61,6 +63,9 @@ static const AVOption omt_options[] = {
       { .i64 = OMT_CHANNEL_VIDEO }, OMT_CHANNEL_VIDEO, OMT_CHANNEL_AUDIO, D, .unit = "channel" },
     { "video", NULL, 0, AV_OPT_TYPE_CONST, { .i64 = OMT_CHANNEL_VIDEO }, 0, 0, D, .unit = "channel" },
     { "audio", NULL, 0, AV_OPT_TYPE_CONST, { .i64 = OMT_CHANNEL_AUDIO }, 0, 0, D, .unit = "channel" },
+    { "rw_timeout", "maximum network read/write wait in microseconds",
+      OFFSET(rw_timeout), AV_OPT_TYPE_INT64,
+      { .i64 = 0 }, 0, INT64_MAX, D },
     { NULL }
 };
 
@@ -102,6 +107,7 @@ static int omt_open(AVFormatContext *ctx)
     OMTContext *s = ctx->priv_data;
     char protocol[16], hostname[256], path[1024], authorization[256];
     char tcp_url[1024];
+    AVDictionary *options = NULL;
     int port = -1, ret;
 
     av_url_split(protocol, sizeof(protocol), authorization, sizeof(authorization),
@@ -113,9 +119,15 @@ static int omt_open(AVFormatContext *ctx)
     ret = ff_url_join(tcp_url, sizeof(tcp_url), "tcp", NULL, hostname, port, NULL);
     if (ret < 0 || ret >= sizeof(tcp_url))
         return AVERROR(EINVAL);
+    ret = av_dict_set_int(&options, "rw_timeout", s->rw_timeout, 0);
+    if (ret < 0) {
+        av_dict_free(&options);
+        return ret;
+    }
     ret = ffurl_open_whitelist(&s->tcp, tcp_url, AVIO_FLAG_READ_WRITE,
-                               &ctx->interrupt_callback, NULL,
+                               &ctx->interrupt_callback, &options,
                                ctx->protocol_whitelist, ctx->protocol_blacklist, NULL);
+    av_dict_free(&options);
     if (ret < 0)
         return ret;
 
@@ -156,7 +168,65 @@ static enum AVPixelFormat omt_pixel_format(uint32_t codec)
     case MKTAG('N', 'V', '1', '2'): return AV_PIX_FMT_NV12;
     case MKTAG('Y', 'V', '1', '2'): return AV_PIX_FMT_YUV420P;
     case MKTAG('P', '2', '1', '6'): return AV_PIX_FMT_P216LE;
+    case MKTAG('U', 'Y', 'V', 'A'): return AV_PIX_FMT_YUVA422P;
+    case MKTAG('P', 'A', '1', '6'): return AV_PIX_FMT_YUVA422P10LE;
     default:                         return AV_PIX_FMT_NONE;
+    }
+}
+
+static void omt_unpack_uyva(uint8_t *dst, const uint8_t *src, int width, int height)
+{
+    size_t luma_size = (size_t)width * height;
+    size_t chroma_size = luma_size / 2;
+    uint8_t *y_plane = dst;
+    uint8_t *u_plane = y_plane + luma_size;
+    uint8_t *v_plane = u_plane + chroma_size;
+    uint8_t *a_plane = v_plane + chroma_size;
+    const uint8_t *alpha = src + luma_size * 2;
+
+    for (int y = 0; y < height; y++) {
+        const uint8_t *src_row = src + (size_t)y * width * 2;
+        uint8_t *y_row = y_plane + (size_t)y * width;
+        uint8_t *u_row = u_plane + (size_t)y * (width / 2);
+        uint8_t *v_row = v_plane + (size_t)y * (width / 2);
+
+        for (int x = 0; x < width; x += 2) {
+            u_row[x / 2] = src_row[x * 2];
+            y_row[x] = src_row[x * 2 + 1];
+            v_row[x / 2] = src_row[x * 2 + 2];
+            y_row[x + 1] = src_row[x * 2 + 3];
+        }
+        memcpy(a_plane + (size_t)y * width, alpha + (size_t)y * width, width);
+    }
+}
+
+static void omt_unpack_pa16(uint8_t *dst, const uint8_t *src, int width, int height)
+{
+    size_t luma_size = (size_t)width * height;
+    uint8_t *y_plane = dst;
+    uint8_t *u_plane = y_plane + luma_size * 2;
+    uint8_t *v_plane = u_plane + luma_size;
+    uint8_t *a_plane = v_plane + luma_size;
+    const uint8_t *uv_plane = src + luma_size * 2;
+    const uint8_t *alpha = uv_plane + luma_size * 2;
+
+    for (int y = 0; y < height; y++) {
+        const uint8_t *y_src = src + (size_t)y * width * 2;
+        const uint8_t *uv_src = uv_plane + (size_t)y * width * 2;
+        const uint8_t *a_src = alpha + (size_t)y * width * 2;
+        uint8_t *y_dst = y_plane + (size_t)y * width * 2;
+        uint8_t *u_dst = u_plane + (size_t)y * width;
+        uint8_t *v_dst = v_plane + (size_t)y * width;
+        uint8_t *a_dst = a_plane + (size_t)y * width * 2;
+
+        for (int x = 0; x < width; x++) {
+            AV_WL16(y_dst + x * 2, AV_RL16(y_src + x * 2) >> 6);
+            AV_WL16(a_dst + x * 2, AV_RL16(a_src + x * 2) >> 6);
+        }
+        for (int x = 0; x < width; x += 2) {
+            AV_WL16(u_dst + x, AV_RL16(uv_src + x * 2) >> 6);
+            AV_WL16(v_dst + x, AV_RL16(uv_src + x * 2 + 2) >> 6);
+        }
     }
 }
 
@@ -169,7 +239,9 @@ static int omt_add_video_stream(AVFormatContext *ctx, const uint8_t *header)
     int height = AV_RL32(header + 8);
     AVStream *st;
 
-    if (width <= 0 || height <= 0 || width > 32768 || height > 32768)
+    if (width <= 0 || height <= 0 || width > 32768 || height > 32768 ||
+        ((codec == MKTAG('U', 'Y', 'V', 'A') || codec == MKTAG('P', 'A', '1', '6')) &&
+         (width & 1)))
         return AVERROR_INVALIDDATA;
     if (codec == MKTAG('V', 'M', 'X', '1')) {
         if (flags & (1 | 2 | 8 | 16)) {
@@ -190,8 +262,14 @@ static int omt_add_video_stream(AVFormatContext *ctx, const uint8_t *header)
         int expected_size;
 
         if (flags & (1 | 4 | 8) ||
-            ((flags & 2) && codec != MKTAG('B', 'G', 'R', 'A')) ||
-            ((flags & 16) && codec != MKTAG('P', '2', '1', '6'))) {
+            ((flags & 2) && codec != MKTAG('B', 'G', 'R', 'A') &&
+             codec != MKTAG('U', 'Y', 'V', 'A') &&
+             codec != MKTAG('P', 'A', '1', '6')) ||
+            ((flags & 16) && codec != MKTAG('P', '2', '1', '6') &&
+             codec != MKTAG('P', 'A', '1', '6')) ||
+            (codec == MKTAG('U', 'Y', 'V', 'A') && !(flags & 2)) ||
+            (codec == MKTAG('P', 'A', '1', '6') &&
+             (flags & (2 | 16)) != (2 | 16))) {
             av_log(ctx, AV_LOG_ERROR, "Unsupported OMT raw video flags 0x%x\n", flags);
             return AVERROR_PATCHWELCOME;
         }
@@ -207,9 +285,10 @@ static int omt_add_video_stream(AVFormatContext *ctx, const uint8_t *header)
             return AVERROR(ENOMEM);
         st->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
         st->codecpar->codec_id = AV_CODEC_ID_RAWVIDEO;
-        st->codecpar->codec_tag = codec;
+        st->codecpar->codec_tag = codec == MKTAG('U', 'Y', 'V', 'A') ||
+                                  codec == MKTAG('P', 'A', '1', '6') ? 0 : codec;
         st->codecpar->format = pix_fmt;
-        if (pix_fmt == AV_PIX_FMT_P216LE)
+        if (pix_fmt == AV_PIX_FMT_P216LE || pix_fmt == AV_PIX_FMT_YUVA422P10LE)
             st->codecpar->bits_per_raw_sample = 10;
     }
     st->codecpar->width = width;
@@ -323,13 +402,35 @@ static int omt_read_packet(AVFormatContext *ctx, AVPacket *pkt)
                 if (expected < 0 || media_length != expected)
                     return AVERROR_INVALIDDATA;
             }
-            ret = av_new_packet(pkt, media_length);
-            if (ret < 0)
-                return ret;
-            ret = ffurl_read_complete(s->tcp, pkt->data, media_length);
-            if (ret < 0 || ret != media_length) {
-                av_packet_unref(pkt);
-                return ret < 0 ? ret : AVERROR_EOF;
+            if (s->codec_tag == MKTAG('U', 'Y', 'V', 'A') ||
+                s->codec_tag == MKTAG('P', 'A', '1', '6')) {
+                uint8_t *wire = av_malloc(media_length);
+                if (!wire)
+                    return AVERROR(ENOMEM);
+                ret = ffurl_read_complete(s->tcp, wire, media_length);
+                if (ret < 0 || ret != media_length) {
+                    av_free(wire);
+                    return ret < 0 ? ret : AVERROR_EOF;
+                }
+                ret = av_new_packet(pkt, media_length);
+                if (ret >= 0) {
+                    if (s->codec_tag == MKTAG('U', 'Y', 'V', 'A'))
+                        omt_unpack_uyva(pkt->data, wire, s->width, s->height);
+                    else
+                        omt_unpack_pa16(pkt->data, wire, s->width, s->height);
+                }
+                av_free(wire);
+                if (ret < 0)
+                    return ret;
+            } else {
+                ret = av_new_packet(pkt, media_length);
+                if (ret < 0)
+                    return ret;
+                ret = ffurl_read_complete(s->tcp, pkt->data, media_length);
+                if (ret < 0 || ret != media_length) {
+                    av_packet_unref(pkt);
+                    return ret < 0 ? ret : AVERROR_EOF;
+                }
             }
             pkt->duration = av_rescale_q(1,
                                          (AVRational){ s->stream->avg_frame_rate.den,

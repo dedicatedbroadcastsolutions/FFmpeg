@@ -1065,14 +1065,19 @@ the form @code{omt://@var{host}:@var{port}}.
 @item channel
 Select the separate OMT media connection to receive, either @code{video}
 (default) or @code{audio}.
+
+@item rw_timeout
+Set the maximum time to wait for network reads or writes, in microseconds.
+The default value of 0 disables the timeout.
 @end table
 
-The demuxer and muxer support raw UYVY, YUY2, BGRA, NV12, YV12, and P216 video,
-8-bit progressive VMX1 video through the @code{vmix} decoder, and FPA1 planar
-floating-point audio. The muxer currently accepts a single receiver session.
-Neither component implements discovery or multiple-receiver fan-out. Interlaced
-and preview video, OMT alpha formats other than BGRA, and high-bit-depth VMX1
-are not supported yet.
+The demuxer and muxer support raw UYVY, YUY2, BGRA, UYVA, PA16, NV12, YV12,
+and P216 video, 8-bit progressive VMX1 video through the @code{vmix} decoder,
+and FPA1 planar floating-point audio. The muxer supports up to 64 receiver
+channel connections.
+DNS-SD and discovery server integration are not implemented. Interlaced and
+preview video, OMT alpha formats other than BGRA, UYVA, and PA16, and
+high-bit-depth VMX1 are not supported yet.
 
 @section rawvideo
 

@@ -291,6 +291,14 @@ static int omt_video_header(AVFormatContext *ctx, AVStream *st,
             codec = MKTAG('B', 'G', 'R', 'A');
             flags |= 2;
             break;
+        case AV_PIX_FMT_YUVA422P:
+            codec = MKTAG('U', 'Y', 'V', 'A');
+            flags |= 2;
+            break;
+        case AV_PIX_FMT_YUVA422P10LE:
+            codec = MKTAG('P', 'A', '1', '6');
+            flags |= 2 | 16;
+            break;
         case AV_PIX_FMT_NV12: codec = MKTAG('N', 'V', '1', '2'); break;
         case AV_PIX_FMT_YUV420P: codec = MKTAG('Y', 'V', '1', '2'); break;
         case AV_PIX_FMT_P216LE:
@@ -332,6 +340,9 @@ static int omt_write_packet(AVFormatContext *ctx, AVPacket *pkt)
     AVCodecParameters *par = st->codecpar;
     int channel = par->codec_type == AVMEDIA_TYPE_VIDEO ? OMT_CHANNEL_VIDEO : OMT_CHANNEL_AUDIO;
     uint8_t extended[OMT_VIDEO_HEADER_SIZE];
+    uint8_t *converted_media = NULL;
+    const uint8_t *media = pkt->data;
+    int media_size = pkt->size;
     int64_t pts = pkt->pts != AV_NOPTS_VALUE ? pkt->pts : pkt->dts;
     int ret;
 
@@ -340,6 +351,67 @@ static int omt_write_packet(AVFormatContext *ctx, AVPacket *pkt)
     if (channel == OMT_CHANNEL_VIDEO) {
         if ((ret = omt_video_header(ctx, st, extended)) < 0)
             return ret;
+        if (par->format == AV_PIX_FMT_YUVA422P ||
+            par->format == AV_PIX_FMT_YUVA422P10LE) {
+            uint8_t *planes[4];
+            int linesizes[4];
+            int ten_bit = par->format == AV_PIX_FMT_YUVA422P10LE;
+            int expected = av_image_get_buffer_size(par->format, par->width,
+                                                    par->height, 1);
+            size_t luma_size = (size_t)par->width * par->height;
+
+            if (expected < 0 || expected > OMT_MAX_FRAME_SIZE - OMT_VIDEO_HEADER_SIZE ||
+                pkt->size != expected || (par->width & 1))
+                return AVERROR_INVALIDDATA;
+            ret = av_image_fill_arrays(planes, linesizes, pkt->data,
+                                       par->format, par->width, par->height, 1);
+            if (ret < 0)
+                return ret;
+            converted_media = av_malloc(pkt->size);
+            if (!converted_media)
+                return AVERROR(ENOMEM);
+            if (ten_bit) {
+                uint8_t *uv_dst = converted_media + luma_size * 2;
+                uint8_t *alpha = uv_dst + luma_size * 2;
+                for (int y = 0; y < par->height; y++) {
+                    const uint8_t *y_row = planes[0] + (ptrdiff_t)y * linesizes[0];
+                    const uint8_t *u_row = planes[1] + (ptrdiff_t)y * linesizes[1];
+                    const uint8_t *v_row = planes[2] + (ptrdiff_t)y * linesizes[2];
+                    const uint8_t *a_row = planes[3] + (ptrdiff_t)y * linesizes[3];
+                    uint8_t *y_dst = converted_media + (size_t)y * par->width * 2;
+                    uint8_t *uv_row = uv_dst + (size_t)y * par->width * 2;
+                    uint8_t *a_dst = alpha + (size_t)y * par->width * 2;
+
+                    for (int x = 0; x < par->width; x++) {
+                        AV_WL16(y_dst + x * 2, (AV_RL16(y_row + x * 2) & 0x3ff) << 6);
+                        AV_WL16(a_dst + x * 2, (AV_RL16(a_row + x * 2) & 0x3ff) << 6);
+                    }
+                    for (int x = 0; x < par->width; x += 2) {
+                        AV_WL16(uv_row + x * 2, (AV_RL16(u_row + x) & 0x3ff) << 6);
+                        AV_WL16(uv_row + x * 2 + 2, (AV_RL16(v_row + x) & 0x3ff) << 6);
+                    }
+                }
+            } else {
+                uint8_t *alpha = converted_media + luma_size * 2;
+                for (int y = 0; y < par->height; y++) {
+                    const uint8_t *y_row = planes[0] + (ptrdiff_t)y * linesizes[0];
+                    const uint8_t *u_row = planes[1] + (ptrdiff_t)y * linesizes[1];
+                    const uint8_t *v_row = planes[2] + (ptrdiff_t)y * linesizes[2];
+                    uint8_t *dst_row = converted_media + (size_t)y * par->width * 2;
+
+                    for (int x = 0; x < par->width; x += 2) {
+                        dst_row[x * 2] = u_row[x / 2];
+                        dst_row[x * 2 + 1] = y_row[x];
+                        dst_row[x * 2 + 2] = v_row[x / 2];
+                        dst_row[x * 2 + 3] = y_row[x + 1];
+                    }
+                    memcpy(alpha + (size_t)y * par->width,
+                           planes[3] + (ptrdiff_t)y * linesizes[3], par->width);
+                }
+            }
+            media = converted_media;
+            media_size = pkt->size;
+        }
     } else {
         int channels = par->ch_layout.nb_channels;
         int samples;
@@ -397,7 +469,7 @@ static int omt_write_packet(AVFormatContext *ctx, AVPacket *pkt)
         OMTReceiver *receiver = *next;
         if (receiver->channel == channel) {
             ret = omt_write_frame(receiver->tcp, 2, pts, extended, sizeof(extended),
-                                  pkt->data, pkt->size);
+                                  media, media_size);
             if (ret < 0) {
                 av_log(ctx, AV_LOG_WARNING, "Removing OMT video receiver: %s\n",
                        av_err2str(ret));
@@ -411,6 +483,7 @@ static int omt_write_packet(AVFormatContext *ctx, AVPacket *pkt)
         next = &receiver->next;
     }
     ff_mutex_unlock(&s->receiver_lock);
+    av_free(converted_media);
     return 0;
 }
 
