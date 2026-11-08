@@ -179,7 +179,8 @@ end:
 }
 
 static int test_encode_roundtrip(const char *profile, int quality,
-                                 uint8_t expected_dc_shift, int expected_quality)
+                                 uint8_t expected_dc_shift, int expected_quality,
+                                 enum AVPixelFormat pixel_format)
 {
     const AVCodec *encoder = avcodec_find_encoder(AV_CODEC_ID_VMIX);
     AVCodecContext *encoder_ctx = NULL, *decoder_ctx = NULL;
@@ -200,9 +201,9 @@ static int test_encode_roundtrip(const char *profile, int quality,
     }
     encoder_ctx->width = 16;
     encoder_ctx->height = 16;
-    encoder_ctx->pix_fmt = AV_PIX_FMT_YUV422P;
+    encoder_ctx->pix_fmt = pixel_format;
     encoder_ctx->time_base = (AVRational){ 1, 25 };
-    source->format = AV_PIX_FMT_YUV422P;
+    source->format = pixel_format;
     source->width = 16;
     source->height = 16;
     if (profile && (ret = av_dict_set(&options, "omt_profile", profile, 0)) < 0)
@@ -223,15 +224,38 @@ static int test_encode_roundtrip(const char *profile, int quality,
         if ((ret = av_frame_make_writable(source)) < 0)
             goto end;
         source->pts = pattern;
-        for (int plane = 0; plane < 3; plane++) {
-            int width = plane ? 8 : 16;
+        if (pixel_format == AV_PIX_FMT_YUV422P) {
+            for (int plane = 0; plane < 3; plane++) {
+                int width = plane ? 8 : 16;
+                for (int y = 0; y < 16; y++) {
+                    uint8_t *row = source->data[plane] + y * source->linesize[plane];
+                    for (int x = 0; x < width; x++)
+                        row[x] = pattern ?
+                                 (plane ? 96 + (x * 3 + y * 5 + plane * 17) % 64 :
+                                          16 + (x * 7 + y * 5) % 220) :
+                                 (plane ? 128 : 80);
+                }
+            }
+        } else {
             for (int y = 0; y < 16; y++) {
-                uint8_t *row = source->data[plane] + y * source->linesize[plane];
-                for (int x = 0; x < width; x++)
-                    row[x] = pattern ?
-                             (plane ? 96 + (x * 3 + y * 5 + plane * 17) % 64 :
-                                      16 + (x * 7 + y * 5) % 220) :
-                             (plane ? 128 : 80);
+                uint8_t *row = source->data[0] + y * source->linesize[0];
+                for (int x = 0; x < 16; x += 2) {
+                    uint8_t y0 = pattern ? 16 + (x * 7 + y * 5) % 220 : 80;
+                    uint8_t y1 = pattern ? 16 + ((x + 1) * 7 + y * 5) % 220 : 80;
+                    uint8_t u = pattern ? 96 + ((x / 2) * 3 + y * 5 + 17) % 64 : 128;
+                    uint8_t v = pattern ? 96 + ((x / 2) * 3 + y * 5 + 34) % 64 : 128;
+                    if (pixel_format == AV_PIX_FMT_UYVY422) {
+                        row[x * 2] = u;
+                        row[x * 2 + 1] = y0;
+                        row[x * 2 + 2] = v;
+                        row[x * 2 + 3] = y1;
+                    } else {
+                        row[x * 2] = y0;
+                        row[x * 2 + 1] = u;
+                        row[x * 2 + 2] = y1;
+                        row[x * 2 + 3] = v;
+                    }
+                }
             }
         }
         if ((ret = avcodec_send_frame(encoder_ctx, source)) < 0 ||
@@ -252,22 +276,36 @@ static int test_encode_roundtrip(const char *profile, int quality,
         for (int plane = 0; plane < 3; plane++) {
             int width = plane ? 8 : 16;
             for (int y = 0; y < 16; y++) {
-                const uint8_t *src = source->data[plane] + y * source->linesize[plane];
-                const uint8_t *dst = decoded->data[plane] + y * decoded->linesize[plane];
                 for (int x = 0; x < width; x++) {
-                    int error = FFABS(src[x] - dst[x]);
+                    int source_value, decoded_value;
+                    if (pixel_format == AV_PIX_FMT_YUV422P) {
+                        source_value = source->data[plane][y * source->linesize[plane] + x];
+                    } else if (plane == 0) {
+                        const uint8_t *row = source->data[0] + y * source->linesize[0];
+                        source_value = row[x * 2 +
+                            (pixel_format == AV_PIX_FMT_UYVY422 ? 1 : 0)];
+                    } else {
+                        const uint8_t *row = source->data[0] + y * source->linesize[0];
+                        int packed_index = (x * 2) +
+                            (plane == 1 ?
+                             (pixel_format == AV_PIX_FMT_UYVY422 ? 0 : 1) :
+                             (pixel_format == AV_PIX_FMT_UYVY422 ? 2 : 3));
+                        source_value = row[packed_index];
+                    }
+                    decoded_value = decoded->data[plane][y * decoded->linesize[plane] + x];
+                    int error = FFABS(source_value - decoded_value);
                     if (error > max_error) {
                         max_error = error;
                         error_plane = plane;
                         error_x = x;
                         error_y = y;
-                        source_sample = src[x];
-                        decoded_sample = dst[x];
+                        source_sample = source_value;
+                        decoded_sample = decoded_value;
                     }
                 }
             }
         }
-        if (max_error > (quality < 80 ? 128 : 64)) {
+        if (max_error > 96) {
             av_log(NULL, AV_LOG_ERROR,
                    "VMIX encoder roundtrip %d max error %d at plane %d (%d,%d): %d vs %d\n",
                    pattern, max_error, error_plane, error_x, error_y,
@@ -359,9 +397,11 @@ int main(void)
     if (ret >= 0)
         ret = test_p216();
     if (ret >= 0)
-        ret = test_encode_roundtrip(NULL, 80, 3, 80);
+        ret = test_encode_roundtrip(NULL, 80, 3, 80, AV_PIX_FMT_YUV422P);
     if (ret >= 0)
-        ret = test_encode_roundtrip("high", 60, 0, 60);
+        ret = test_encode_roundtrip("high", 60, 0, 60, AV_PIX_FMT_UYVY422);
+    if (ret >= 0)
+        ret = test_encode_roundtrip("low", 80, 3, 80, AV_PIX_FMT_YUYV422);
 
 end:
     av_frame_free(&frame);

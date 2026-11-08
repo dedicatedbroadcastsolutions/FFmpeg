@@ -217,12 +217,14 @@ static av_cold int vmix_encode_init(AVCodecContext *avctx)
 {
     VMIXEncContext *s = avctx->priv_data;
 
-    if (avctx->pix_fmt != AV_PIX_FMT_YUV422P ||
+    if ((avctx->pix_fmt != AV_PIX_FMT_YUV422P &&
+         avctx->pix_fmt != AV_PIX_FMT_UYVY422 &&
+         avctx->pix_fmt != AV_PIX_FMT_YUYV422) ||
         avctx->width < 16 || avctx->height < 16 ||
         avctx->width > 7680 || avctx->height > 4080 ||
         avctx->width % 16 || avctx->height % 16) {
         av_log(avctx, AV_LOG_ERROR,
-               "VMIX encoder requires YUV422P dimensions divisible by 16 (max 7680x4080)\n");
+               "VMIX encoder requires YUV422P, UYVY422, or YUYV422 dimensions divisible by 16\n");
         return AVERROR(EINVAL);
     }
     avctx->bits_per_raw_sample = 8;
@@ -237,7 +239,11 @@ static int vmix_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
 {
     VMIXEncContext *s = avctx->priv_data;
     VMIXEncodeSlice *slices = NULL;
+    AVFrame planar_frame = { 0 };
+    const AVFrame *encode_frame = frame;
+    uint8_t *planar_data = NULL;
     size_t slice_capacity, total_capacity;
+    size_t luma_size, chroma_size, planar_size;
     int nb_slices;
     int ret = 0;
 
@@ -245,16 +251,25 @@ static int vmix_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
     if (!frame)
         return 0;
     nb_slices = frame->height / 16;
-    if (frame->format != AV_PIX_FMT_YUV422P || frame->width != avctx->width ||
+    if (frame->format != avctx->pix_fmt || frame->width != avctx->width ||
         frame->height != avctx->height || frame->width < 16 || frame->height < 16 ||
         frame->width > 7680 || frame->height > 4080 ||
         frame->width % 16 || frame->height % 16)
         return AVERROR(EINVAL);
-    for (int plane = 0; plane < 3; plane++) {
-        int width = plane ? frame->width / 2 : frame->width;
-        if (!frame->data[plane] || FFABS(frame->linesize[plane]) < width)
-            return AVERROR(EINVAL);
+    if (frame->format == AV_PIX_FMT_YUV422P) {
+        for (int plane = 0; plane < 3; plane++) {
+            int width = plane ? frame->width / 2 : frame->width;
+            if (!frame->data[plane] || FFABS(frame->linesize[plane]) < width)
+                return AVERROR(EINVAL);
+        }
+    } else if (!frame->data[0] || FFABS(frame->linesize[0]) < frame->width * 2) {
+        return AVERROR(EINVAL);
     }
+    if (av_size_mult((size_t)frame->width, frame->height, &luma_size) < 0 ||
+        av_size_mult(luma_size, 2, &planar_size) < 0)
+        return AVERROR(EINVAL);
+    chroma_size = luma_size / 2;
+
     if (av_size_mult((size_t)frame->width, 128, &slice_capacity) < 0 ||
         slice_capacity > SIZE_MAX - 4096)
         return AVERROR(EINVAL);
@@ -269,6 +284,42 @@ static int vmix_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
     slices = av_calloc(nb_slices, sizeof(*slices));
     if (!slices)
         return AVERROR(ENOMEM);
+    if (frame->format != AV_PIX_FMT_YUV422P) {
+        planar_data = av_malloc(planar_size);
+        if (!planar_data) {
+            ret = AVERROR(ENOMEM);
+            goto end;
+        }
+        planar_frame.width = frame->width;
+        planar_frame.height = frame->height;
+        planar_frame.format = AV_PIX_FMT_YUV422P;
+        planar_frame.pts = frame->pts;
+        planar_frame.data[0] = planar_data;
+        planar_frame.data[1] = planar_data + luma_size;
+        planar_frame.data[2] = planar_data + luma_size + chroma_size;
+        planar_frame.linesize[0] = frame->width;
+        planar_frame.linesize[1] = planar_frame.linesize[2] = frame->width / 2;
+        for (int y = 0; y < frame->height; y++) {
+            const uint8_t *src = frame->data[0] + (ptrdiff_t)y * frame->linesize[0];
+            uint8_t *dst_y = planar_frame.data[0] + (ptrdiff_t)y * planar_frame.linesize[0];
+            uint8_t *dst_u = planar_frame.data[1] + (ptrdiff_t)y * planar_frame.linesize[1];
+            uint8_t *dst_v = planar_frame.data[2] + (ptrdiff_t)y * planar_frame.linesize[2];
+            for (int x = 0; x < frame->width; x += 2) {
+                if (frame->format == AV_PIX_FMT_UYVY422) {
+                    dst_u[x / 2] = src[x * 2];
+                    dst_y[x] = src[x * 2 + 1];
+                    dst_v[x / 2] = src[x * 2 + 2];
+                    dst_y[x + 1] = src[x * 2 + 3];
+                } else {
+                    dst_y[x] = src[x * 2];
+                    dst_u[x / 2] = src[x * 2 + 1];
+                    dst_y[x + 1] = src[x * 2 + 2];
+                    dst_v[x / 2] = src[x * 2 + 3];
+                }
+            }
+        }
+        encode_frame = &planar_frame;
+    }
     for (int i = 0; i < nb_slices; i++) {
         PutBitContext dc_pb, ac_pb;
 
@@ -281,7 +332,7 @@ static int vmix_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
         init_put_bits(&dc_pb, slices[i].dc, slice_capacity);
         init_put_bits(&ac_pb, slices[i].ac, slice_capacity);
         for (int plane = 0; plane < 3; plane++) {
-            ret = vmix_encode_plane(s, &dc_pb, &ac_pb, frame, plane, i * 16);
+            ret = vmix_encode_plane(s, &dc_pb, &ac_pb, encode_frame, plane, i * 16);
             if (ret < 0)
                 goto end;
         }
@@ -326,6 +377,7 @@ end:
         av_freep(&slices[i].ac);
     }
     av_free(slices);
+    av_free(planar_data);
     return ret;
 }
 
@@ -338,5 +390,5 @@ const FFCodec ff_vmix_encoder = {
     .priv_data_size   = sizeof(VMIXEncContext),
     .init             = vmix_encode_init,
     FF_CODEC_ENCODE_CB(vmix_encode_frame),
-    CODEC_PIXFMTS(AV_PIX_FMT_YUV422P),
+    CODEC_PIXFMTS(AV_PIX_FMT_YUV422P, AV_PIX_FMT_UYVY422, AV_PIX_FMT_YUYV422),
 };
