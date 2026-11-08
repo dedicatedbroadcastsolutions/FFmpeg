@@ -324,9 +324,26 @@ end:
 
 int main(void)
 {
+    static const uint8_t uyvy[] = {
+        128, 16, 128, 64, 129, 32, 129, 80,
+    };
+    static const uint8_t yuy2[] = {
+        16, 128, 64, 128, 32, 129, 80, 129,
+    };
+    static const uint8_t bgra[] = {
+        1, 2, 3, 4, 5, 6, 7, 8,
+        9, 10, 11, 12, 13, 14, 15, 16,
+    };
     static const uint8_t bgrx[] = {
         32, 33, 34, 35, 36, 37, 38, 39,
         40, 41, 42, 43, 44, 45, 46, 47,
+    };
+    static const uint8_t nv12[] = {
+        16, 32, 64, 80, 128, 129,
+    };
+    static const uint8_t p216[] = {
+        0x00, 0x10, 0x40, 0x10, 0x80, 0x10, 0xc0, 0x10,
+        0x00, 0x14, 0x80, 0x16, 0x40, 0x14, 0xc0, 0x16,
     };
     static const uint8_t uyva_wire[] = {
         128, 16, 128, 64, 129, 32, 129, 80, 0, 64, 128, 255,
@@ -351,8 +368,18 @@ int main(void)
         0, 0, 0, 1, 0, 2, 255, 3,
     };
     static const OMTTestCase tests[] = {
+                { MKTAG('U', 'Y', 'V', 'Y'), 0, AV_PIX_FMT_UYVY422,
+                    uyvy, sizeof(uyvy), uyvy, sizeof(uyvy) },
+                { MKTAG('Y', 'U', 'Y', '2'), 0, AV_PIX_FMT_YUYV422,
+                    yuy2, sizeof(yuy2), yuy2, sizeof(yuy2) },
+                { MKTAG('B', 'G', 'R', 'A'), 2, AV_PIX_FMT_BGRA,
+                    bgra, sizeof(bgra), bgra, sizeof(bgra) },
         { MKTAG('B', 'G', 'R', 'X'), 0, AV_PIX_FMT_BGR0,
           bgrx, sizeof(bgrx), bgrx, sizeof(bgrx) },
+                { MKTAG('N', 'V', '1', '2'), 0, AV_PIX_FMT_NV12,
+                    nv12, sizeof(nv12), nv12, sizeof(nv12) },
+                { MKTAG('P', '2', '1', '6'), 16, AV_PIX_FMT_P216LE,
+                    p216, sizeof(p216), p216, sizeof(p216) },
         { MKTAG('Y', 'V', '1', '2'), 0, AV_PIX_FMT_YUV420P,
             yv12_wire, sizeof(yv12_wire), yv12_planar, sizeof(yv12_planar) },
         { MKTAG('U', 'Y', 'V', 'A'), 2, AV_PIX_FMT_YUVA422P,
