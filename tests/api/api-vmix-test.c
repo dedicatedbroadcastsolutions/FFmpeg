@@ -178,6 +178,20 @@ end:
     return ret;
 }
 
+static int expected_bgr0_yuv(const uint8_t *pixel, int plane)
+{
+    static const int coefficients[3][3] = {
+        { 66, 129, 25 }, { -38, -74, 112 }, { 112, -94, -18 },
+    };
+    int channel = plane == 0 ? 0 : plane;
+    int sum = pixel[2] * coefficients[channel][0] +
+              pixel[1] * coefficients[channel][1] +
+              pixel[0] * coefficients[channel][2] + 128;
+    int scaled = sum < 0 ? -((-sum + 255) >> 8) : sum >> 8;
+
+    return av_clip_uint8(scaled + (plane == 0 ? 16 : 128));
+}
+
 static int test_encode_roundtrip(const char *profile, int quality,
                                  uint8_t expected_dc_shift, int expected_quality,
                                  enum AVPixelFormat pixel_format)
@@ -262,8 +276,9 @@ static int test_encode_roundtrip(const char *profile, int quality,
             for (int y = 0; y < 16; y++) {
                 uint8_t *row = source->data[0] + y * source->linesize[0];
                 for (int x = 0; x < 16; x++) {
-                    uint8_t value = pattern ? 16 + (x * 7 + y * 5) % 220 : 80;
-                    row[x * 4] = row[x * 4 + 1] = row[x * 4 + 2] = value;
+                    row[x * 4] = pattern ? 16 + (x * 29 + y * 17) % 220 : 80;
+                    row[x * 4 + 1] = pattern ? 16 + (x * 11 + y * 31) % 220 : 80;
+                    row[x * 4 + 2] = pattern ? 16 + (x * 23 + y * 7) % 220 : 80;
                     row[x * 4 + 3] = 0;
                 }
             }
@@ -311,6 +326,15 @@ static int test_encode_roundtrip(const char *profile, int quality,
                     int source_value, decoded_value;
                     if (pixel_format == AV_PIX_FMT_YUV422P) {
                         source_value = source->data[plane][y * source->linesize[plane] + x];
+                    } else if (pixel_format == AV_PIX_FMT_BGR0) {
+                        const uint8_t *row = source->data[0] + y * source->linesize[0];
+                        if (plane) {
+                            int first = expected_bgr0_yuv(row + x * 8, plane);
+                            int second = expected_bgr0_yuv(row + x * 8 + 4, plane);
+                            source_value = (first + second) >> 1;
+                        } else {
+                            source_value = expected_bgr0_yuv(row + x * 4, plane);
+                        }
                     } else if (plane == 0 &&
                                (pixel_format == AV_PIX_FMT_NV12 ||
                                 pixel_format == AV_PIX_FMT_YUV420P)) {
@@ -329,13 +353,6 @@ static int test_encode_roundtrip(const char *profile, int quality,
                         } else {
                             source_value = source->data[plane][chroma_y *
                                 source->linesize[plane] + x];
-                        }
-                    } else if (pixel_format == AV_PIX_FMT_BGR0) {
-                        if (plane) {
-                            source_value = 128;
-                        } else {
-                            const uint8_t *row = source->data[0] + y * source->linesize[0];
-                            source_value = ((row[x * 4] * 220 + 128) >> 8) + 16;
                         }
                     } else {
                         const uint8_t *row = source->data[0] + y * source->linesize[0];
@@ -360,8 +377,8 @@ static int test_encode_roundtrip(const char *profile, int quality,
         }
         if (max_error > 96) {
             av_log(NULL, AV_LOG_ERROR,
-                   "VMIX encoder roundtrip %d max error %d at plane %d (%d,%d): %d vs %d\n",
-                   pattern, max_error, error_plane, error_x, error_y,
+                     "VMIX encoder roundtrip format %d pattern %d max error %d at plane %d (%d,%d): %d vs %d\n",
+                     pixel_format, pattern, max_error, error_plane, error_x, error_y,
                    source_sample, decoded_sample);
             ret = AVERROR_INVALIDDATA;
             goto end;
