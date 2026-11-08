@@ -256,6 +256,13 @@ static int run_benchmark(int width, int height, int frames)
     double samples = (double)width * height * 2 * frames;
     double native_psnr = native_sse ? 10.0 * log10(65025.0 * samples / native_sse) : INFINITY;
     double reference_psnr = reference_sse ? 10.0 * log10(65025.0 * samples / reference_sse) : INFINITY;
+    double psnr_delta = fabs(native_psnr - reference_psnr);
+    if (max_error > 2 || psnr_delta > 0.1) {
+        fprintf(stderr, "VMIX quality parity failed: PSNR delta %.3f dB (limit 0.1), max cross error %d (limit 2)\n",
+                psnr_delta, max_error);
+        ret = AVERROR_INVALIDDATA;
+        goto end;
+    }
 
         printf("vmix,ffmpeg,encode,%d,%d,%d,1,%.6f,%.2f,%" PRIu64 ",%.3f,%d\n",
            width, height, frames, ff_encode_us / 1000000.0,
@@ -270,7 +277,7 @@ static int run_benchmark(int width, int height, int frames)
            width, height, frames, ref_decode_us / 1000000.0,
            frames * 1000000.0 / FFMAX(ref_decode_us, 1), ref_bytes, reference_psnr, max_error);
     fprintf(stderr, "quality,ffmpeg_psnr=%.3f,libvmx_psnr=%.3f,delta_db=%.3f,max_cross_error=%d\n",
-            native_psnr, reference_psnr, fabs(native_psnr - reference_psnr), max_error);
+            native_psnr, reference_psnr, psnr_delta, max_error);
 
 end:
     VMX_Destroy(ref_enc);

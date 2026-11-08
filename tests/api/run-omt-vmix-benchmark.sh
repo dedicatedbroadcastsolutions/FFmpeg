@@ -62,6 +62,11 @@ if [ "$benchmark_mode" != omt ]; then
 fi
 
 if [ "$benchmark_mode" != vmix ]; then
+    if ! command -v avahi-daemon >/dev/null 2>&1 || ! avahi-daemon --check >/dev/null 2>&1; then
+        printf '%s\n' 'libomt runtime benchmark requires a running Avahi daemon.' \
+            'Start it with: sudo service avahi-daemon start' >&2
+        exit 1
+    fi
     for library in libavahi-common.so.3 libavahi-client.so.3; do
         if ldconfig -p 2>/dev/null | grep -q "$library"; then
             continue
@@ -82,8 +87,20 @@ if [ "$benchmark_mode" != vmix ]; then
     while [ "$run" -le "$repeats" ]; do
         port=$((20000 + ($$ + run * 251) % 29998))
         printf '# OMT repeat %s\n' "$run"
-        tests/api/api-omt-bench-test --native "$input" "$width" "$height" "$frames" "$port"
-        tests/api/api-omt-bench-test --reference "$input" "$width" "$height" "$frames" "$((port + 1))"
+        native_result=$(tests/api/api-omt-bench-test --native "$input" "$width" "$height" "$frames" "$port")
+        reference_result=$(tests/api/api-omt-bench-test --reference "$input" "$width" "$height" "$frames" "$((port + 1))")
+        native_psnr=$(printf '%s\n' "$native_result" | awk -F, '$1 == "omt" { print $10 }')
+        reference_psnr=$(printf '%s\n' "$reference_result" | awk -F, '$1 == "omt" { print $10 }')
+        if [ -z "$native_psnr" ] || [ -z "$reference_psnr" ]; then
+            printf 'OMT repeat %s did not produce both quality measurements.\n' "$run" >&2
+            exit 1
+        fi
+        awk -v run="$run" -v native="$native_psnr" -v reference="$reference_psnr" \
+            'BEGIN { delta = native - reference; if (delta < 0) delta = -delta; printf "# OMT quality repeat %s: FFmpeg %.3f dB, libomt %.3f dB, delta %.3f dB\n", run, native, reference, delta; if (delta > 0.1) exit 1 }' || {
+            printf 'OMT quality parity failed; performance results rejected.\n' >&2
+            exit 1
+        }
+        printf '%s\n%s\n' "$native_result" "$reference_result"
         run=$((run + 1))
     done
 fi

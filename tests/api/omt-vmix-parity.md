@@ -26,9 +26,11 @@ The benchmark runner first runs both FATE tests. It then builds the optional
 comparison programs and reports raw CSV rows for VMIX encode/decode and OMT
 loopback end-to-end runs. VMIX checks profile/quality headers, decodes each
 implementation's packets with both decoders, and reports source-relative PSNR
-and cross-decoder error. OMT checks received frame counts, decoded dimensions,
-bytes, and source-relative PSNR. Timing excludes process/build/startup costs and
-starts after loopback setup; each repeat is printed separately, not averaged.
+and cross-decoder error; it rejects a PSNR delta over 0.1 dB or cross error over
+2 code values. OMT checks received frame counts, decoded dimensions, bytes, and
+source-relative PSNR; it rejects native/reference PSNR differences over 0.1 dB.
+Timing excludes process/build/startup costs and starts after loopback setup; each
+repeat is printed separately, not averaged.
 
 The VMIX comparison uses one thread for both implementations. The OMT FFmpeg
 path uses one encode/decode thread; libomt controls its internal thread count,
